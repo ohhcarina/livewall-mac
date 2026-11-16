@@ -1,0 +1,16 @@
+.DS_Store
+*.swp
+app/.build/
+app/.swiftpm/
+app/dist/
+*.app/
+*.dmg
+# test clips and exports
+*.mov
+*.MOV
+*.mp4
+*.MP4
+*.heic
+*.pvt/
+# the CLI's `frames` command and LIVEWALL_SNAPSHOT write PNGs of source frames
+app/**/*.png
