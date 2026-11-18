@@ -69,6 +69,52 @@ final class SegmentPlannerTests: XCTestCase {
         XCTAssertGreaterThan(plan.report.stepDiffs.suffix(2).min()!, SegmentPlanner.sameFrame)
     }
 
+    /// A freeze at the end of a longer stretch (11-18, GTA at 1:17.7): the cover becomes the freeze's first frame, but
+    /// the start stays where it was chosen, so everything played is inside the chosen stretch.
+    func testFrozenEndKeepsTheStart() async throws {
+        let source = try await clip(frames: 90) { 60 + 2 * Double(min($0, 70)) }       // still from frame 70 on
+        let start = 40.5 / 30, cover = 85.5 / 30
+        let plan = try await SegmentPlanner.plan(source: source, start: start, cover: cover)
+        XCTAssertEqual(Int(plan.times.last! * 30), 70)
+        XCTAssertEqual(plan.times.first!, start, accuracy: 0.5 / 30, "the start the person chose")
+    }
+
+    /// A slow reveal (11-18, a logo whose background faded in over 3 s): each frame differs from the next by less than
+    /// `sameFrame`, but they add up. The cover the person picked stays where it is; only true repeats move it.
+    func testSlowRevealKeepsTheCover() async throws {
+        // a bright band widens by 1 column every frame: 100 / 160 = 0.6 per frame, well under `sameFrame`
+        let source = try await reveal(frames: 120, framesPerColumn: 1)
+        let cover = 110.5 / 30
+        let plan = try await SegmentPlanner.plan(source: source, start: cover - 1, cover: cover)
+        XCTAssertEqual(plan.times.last!, cover, accuracy: 8 / 30, "walked back \((cover - plan.times.last!) * 30) frames")
+    }
+
+    /// Slower still (11-18 review): each pass walks most of the frames it looks at; later passes must keep comparing
+    /// with the picked cover, not re-anchor on where the last pass stopped and chain on.
+    func testVerySlowRevealDoesNotChainAcrossPasses() async throws {
+        let source = try await reveal(frames: 300, framesPerColumn: 5)
+        let cover = 290.5 / 30
+        let plan = try await SegmentPlanner.plan(source: source, start: cover - 1, cover: cover)
+        XCTAssertEqual(plan.times.last!, cover, accuracy: 10 / 30, "walked back \((cover - plan.times.last!) * 30) frames")
+    }
+
+    /// A bright band over grey that widens by one column every `framesPerColumn` frames, 160x90, 30 fps.
+    private func reveal(frames count: Int, framesPerColumn: Int) async throws -> FrameSource {
+        let w = 160, h = 90
+        let frames: [RGB16Image] = (0..<count).map { i in
+            var img = RGB16Image(width: w, height: h)
+            for y in 0..<h { for x in 0..<w {
+                let v = UInt16((x < i / framesPerColumn ? 160 : 60) * 257), p = (y * w + x) * 4
+                img.pixels[p] = v; img.pixels[p + 1] = v; img.pixels[p + 2] = v
+            } }
+            return img
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("lw-seg-\(UUID().uuidString).mov")
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        try await HEVCWriter.write(frames: frames, settings: .init(width: w, height: h, fps: 30), to: url)
+        return try await FrameSource(url: url)
+    }
+
     /// Every source frame differs from the next by more than a last step may (fireworks, 11-12 R7-2): the cover is
     /// shown twice instead of mixing or skipping.
     func testFastClipRepeatsTheCover() async throws {

@@ -69,6 +69,7 @@ public enum SegmentPlanner {
         let shrink = { (image: RGB16Image) in try WindowPlanner.cropped(image, to: crop, width: sampleWidth) }
         // a freeze longer than the frames looked at one by one is walked back in several passes
         let passes = 5
+        var pickedCover: RGB16Image?
         for attempt in 0..<passes {
             let even = frameIndices(start: startTime, cover: coverTime, frameRate: fps, duration: source.duration)
             let cover = even[10]
@@ -79,14 +80,20 @@ public enum SegmentPlanner {
             try Task.checkCancellation()
             guard near.count > 1 else { throw EngineError.invalid("no frames decoded before the cover") }
             let nearImage = { (index: Int) in near[min(max(0, index - nearFirst), near.count - 1)] }
-            // a cover on a repeated or frozen frame becomes the first frame showing that picture
+            // a cover on a repeated or frozen frame becomes the first frame showing that picture. Compared with the cover,
+            // not with the next frame: a slow reveal moves under `sameFrame` per frame yet adds up (11-18: a logo whose
+            // background faded in over 3 s had the cover walked back 96 frames, to before the background showed)
+            // (later passes keep comparing with the picked cover's picture, or each pass would re-anchor and chain again)
+            let reference = pickedCover ?? nearImage(cover)
+            pickedCover = reference
             var repeats = 0
             while cover - repeats - 1 >= max(10, nearFirst),
-                  nearImage(cover - repeats).meanAbsDiff(nearImage(cover - repeats - 1)) < sameFrame { repeats += 1 }
+                  reference.meanAbsDiff(nearImage(cover - repeats - 1)) < sameFrame { repeats += 1 }
             if attempt < passes - 1, repeats > 0 {
-                // the start moves with it: the same stretch, the same spacing (else one gap doubles, 11-12 R8)
+                // the start stays where the person put it (11-18: 「用户有可能会想要最后不动……不要直接做」): what plays
+                // stays inside the chosen stretch, from its start to where the picture stops, then rests there.
+                // `frameIndices` still keeps 10 frames before the cover, so a 10-frame stretch moves whole (11-12 R8)
                 coverTime = mid(cover - repeats, fps)
-                startTime = max(0, startTime - Double(repeats) / fps)
                 continue
             }
 

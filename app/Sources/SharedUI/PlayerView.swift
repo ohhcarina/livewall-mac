@@ -1,6 +1,7 @@
 import AVFoundation
-import AppKit
 import SwiftUI
+#if os(macOS)
+import AppKit
 
 /// The bare video picture, no transport controls (LiveWall: the trim bar is the control surface).
 public struct PlayerView: NSViewRepresentable {
@@ -39,3 +40,4 @@ public struct PlayerView: NSViewRepresentable {
         }
     }
 }
+#endif

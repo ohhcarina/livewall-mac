@@ -222,7 +222,15 @@ private struct EmptyState: View {
                 .glassButtonStyle(prominent: true)
                 .controlSize(.extraLarge)
                 Text("或者直接把视频拖进来").font(.callout).foregroundStyle(.tertiary)
-                if project.phase == .loading { ProgressView().controlSize(.small) }
+                if let p = project.proxyProgress {
+                    // the editing copy: a few seconds for 4K, once per video
+                    VStack(spacing: 6) {
+                        ProgressView(value: p).frame(width: 220)
+                        Text("正在准备编辑用的副本…").font(.callout).foregroundStyle(.secondary)
+                    }
+                } else if project.phase == .loading {
+                    ProgressView().controlSize(.small)
+                }
             }
             .padding(40)
             DropHighlight(targeted: targeted)
@@ -257,6 +265,18 @@ private struct Editor: View {
             // stacked, not overlaid: the bar's height changes with its rows (two since 11-12)
             VStack(spacing: 16) {
                 stage
+                    .overlay {
+                        // another video's editing copy is being made while this one is still shown (11-18 review)
+                        if let p = project.proxyProgress {
+                            VStack(spacing: 8) {
+                                ProgressView(value: p).frame(width: 220)
+                                Text("正在准备编辑用的副本…").font(.callout).foregroundStyle(.secondary)
+                            }
+                            .padding(16)
+                            .glassPanel(cornerRadius: 16)
+                            .transition(.opacity)
+                        }
+                    }
                     .padding(.horizontal, 40)
                     .padding(.top, 60)
                 TrimBar(project: project)
@@ -320,11 +340,12 @@ private struct Editor: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 // while a new plan is computed the old one stays, slightly dimmed: no flashing spinner
-                // while the cover is dragged, the picked frame stands in for the cover (the preview rests on its last frame)
-                LockSimView(frames: project.scrubCover.map { Array(project.frames.dropLast()) + [$0] } ?? project.frames,
-                            aspect: project.aspect, replayToken: project.wakeCount, holdOnCover: project.isScrubbingCover)
+                // while the cover or the start is dragged, the frame under the pointer stands in for the cover (the preview rests on its last frame)
+                LockSimView(frames: project.scrubFrame.map { Array(project.frames.dropLast()) + [$0] } ?? project.frames,
+                            aspect: project.aspect, replayToken: project.wakeCount, holdOnCover: project.isScrubbing,
+                            showsHoverHint: !SnapshotHook.scripted)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .opacity(project.phase == .planning && project.scrubCover == nil ? 0.55 : 1)
+                    .opacity(project.phase == .planning && project.scrubFrame == nil ? 0.55 : 1)
                     .animation(.easeOut(duration: 0.2), value: project.phase == .planning)
                     .transition(.opacity)
             }
@@ -340,11 +361,14 @@ private struct Editor: View {
 private struct SourceStage: View {
     @Bindable var project: Project
     @State private var dragStartFocus: CGPoint?
+    /// The kept area when an edge or corner drag began.
+    @State private var areaAtBegin: CGRect?
 
     var body: some View {
         let size = project.source?.size ?? CGSize(width: 16, height: 9)
         GeometryReader { geo in
-            let fit = fitted(size, in: geo.size)
+            // room around the picture for the crop handles
+            let fit = fitted(size, in: CGSize(width: geo.size.width - 24, height: geo.size.height - 24))
             ZStack(alignment: .topLeading) {
                 if let player = project.player {
                     PlayerView(player: player)
@@ -352,51 +376,212 @@ private struct SourceStage: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
                 }
-                if project.mode == .crop { cropOverlay(fit: fit) }
+                framing(fit: fit)
             }
             .frame(width: fit.width, height: fit.height)
             .position(x: geo.size.width / 2, y: geo.size.height / 2)
+            .overlay(alignment: .topTrailing) {
+                if project.area != Reframe.wholePicture {
+                    Button("还原整幅画面", systemImage: "arrow.uturn.backward") {
+                        project.beginEdit(); project.area = Reframe.wholePicture; project.endEdit("还原裁切")
+                    }
+                    .glassButtonStyle(prominent: false)
+                    .padding(8)
+                    .transition(.opacity)
+                }
+            }
         }
     }
 
-    private func cropOverlay(fit: CGSize) -> some View {
+    /// What is kept (the crop box, with handles on its edges and corners: 11-18 「上下有黑边……没办法裁剪」) and, when
+    /// filling the screen, the viewfinder inside it.
+    private func framing(fit: CGSize) -> some View {
+        let a = project.area
+        let kept = CGRect(x: a.minX * fit.width, y: a.minY * fit.height, width: a.width * fit.width, height: a.height * fit.height)
         let f = project.cropFraction
-        let rect = CGRect(x: f.minX * fit.width, y: f.minY * fit.height, width: f.width * fit.width, height: f.height * fit.height)
+        let finder = CGRect(x: f.minX * fit.width, y: f.minY * fit.height, width: f.width * fit.width, height: f.height * fit.height)
+        let filling = project.mode == .crop
         return ZStack(alignment: .topLeading) {
-            // dim what will be cut away
+            // cut away by the crop box: dark; outside the viewfinder but kept: dimmed
             Path { p in
                 p.addRect(CGRect(origin: .zero, size: fit))
-                p.addRoundedRect(in: rect, cornerSize: CGSize(width: 6, height: 6))
+                p.addRect(kept)
             }
-            .fill(.black.opacity(0.55), style: FillStyle(eoFill: true))
-
-            RoundedRectangle(cornerRadius: 6).strokeBorder(.white, lineWidth: 2)
-                .overlay { thirds }
-                .frame(width: rect.width, height: rect.height)
-                .offset(x: rect.minX, y: rect.minY)
+            .fill(.black.opacity(0.72), style: FillStyle(eoFill: true))
+            .allowsHitTesting(false)
+            if filling {
+                Path { p in
+                    p.addRect(kept)
+                    p.addRoundedRect(in: finder, cornerSize: CGSize(width: 6, height: 6))
+                }
+                .fill(.black.opacity(0.45), style: FillStyle(eoFill: true))
                 .allowsHitTesting(false)
+                RoundedRectangle(cornerRadius: 6).strokeBorder(.white, lineWidth: 2)
+                    .overlay { thirds }
+                    .frame(width: finder.width, height: finder.height)
+                    .offset(x: finder.minX, y: finder.minY)
+                    .allowsHitTesting(false)
+            }
+            // the picture inside the crop box moves the viewfinder, like moving a photo inside a frame
+            Color.clear
+                .frame(width: kept.width, height: kept.height)
+                .contentShape(Rectangle())
+                .offset(x: kept.minX, y: kept.minY)
+                .gesture(DragGesture(minimumDistance: 1).onChanged { g in
+                    guard filling else { return }
+                    if dragStartFocus == nil {
+                        dragStartFocus = CGPoint(x: project.focusX, y: project.focusY)
+                        project.beginEdit()
+                    }
+                    let start = dragStartFocus ?? .zero
+                    let spareW = kept.width - finder.width, spareH = kept.height - finder.height
+                    if spareW > 1 { project.focusX = min(1, max(0, start.x + g.translation.width / spareW)) }
+                    if spareH > 1 { project.focusY = min(1, max(0, start.y + g.translation.height / spareH)) }
+                }.onEnded { _ in
+                    guard dragStartFocus != nil else { return }
+                    dragStartFocus = nil
+                    project.endEdit("调整取景")
+                })
+                .grabCursor(active: dragStartFocus != nil)
+                .accessibilityElement()
+                .accessibilityLabel("取景框")
+                .accessibilityHint("拖移画面以选择保留的部分")
+            cropHandles(kept: kept, fit: fit)
         }
         .frame(width: fit.width, height: fit.height, alignment: .topLeading)
-        // the whole picture is the handle, like moving a photo inside a frame
-        .contentShape(Rectangle())
-        .gesture(DragGesture(minimumDistance: 1).onChanged { g in
-            if dragStartFocus == nil {
-                dragStartFocus = CGPoint(x: project.focusX, y: project.focusY)
-                project.beginEdit()
+    }
+
+    fileprivate enum Edge { case left, right, top, bottom }
+
+    /// Yellow brackets at the corners and bars at the edge midpoints, each dragging its edges.
+    private func cropHandles(kept: CGRect, fit: CGSize) -> some View {
+        let handles: [(edges: [Edge], at: CGPoint, horizontal: Bool?)] = [
+            ([.left, .top], CGPoint(x: kept.minX, y: kept.minY), nil), ([.right, .top], CGPoint(x: kept.maxX, y: kept.minY), nil),
+            ([.left, .bottom], CGPoint(x: kept.minX, y: kept.maxY), nil), ([.right, .bottom], CGPoint(x: kept.maxX, y: kept.maxY), nil),
+            ([.top], CGPoint(x: kept.midX, y: kept.minY), true), ([.bottom], CGPoint(x: kept.midX, y: kept.maxY), true),
+            ([.left], CGPoint(x: kept.minX, y: kept.midY), false), ([.right], CGPoint(x: kept.maxX, y: kept.midY), false),
+        ]
+        // the whole border can be taken, not just the handles (11-18: 「光标在边框的情况下要变成抓手」)
+        let grip: CGFloat = 12
+        let sides: [(edges: [Edge], rect: CGRect)] = [
+            // outward from the line only: a drag starting just inside still moves the viewfinder (11-18 review)
+            ([.top], CGRect(x: kept.minX, y: kept.minY - grip, width: kept.width, height: grip + 1)),
+            ([.bottom], CGRect(x: kept.minX, y: kept.maxY - 1, width: kept.width, height: grip + 1)),
+            ([.left], CGRect(x: kept.minX - grip, y: kept.minY, width: grip + 1, height: kept.height)),
+            ([.right], CGRect(x: kept.maxX - 1, y: kept.minY, width: grip + 1, height: kept.height)),
+        ]
+        return ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 2).strokeBorder(Color.yellow.opacity(0.9), lineWidth: 1.5)
+                .frame(width: kept.width, height: kept.height)
+                .offset(x: kept.minX, y: kept.minY)
+                .allowsHitTesting(false)
+            ForEach(Array(sides.enumerated()), id: \.offset) { _, side in
+                Color.clear
+                    .frame(width: side.rect.width, height: side.rect.height)
+                    .contentShape(Rectangle())
+                    .position(x: side.rect.midX, y: side.rect.midY)
+                    .gesture(edgeDrag(side.edges, fit: fit))
+                    .cropCursor(side.edges, dragging: areaAtBegin != nil)
+                    .accessibilityHidden(true)
             }
-            let start = dragStartFocus ?? .zero
-            let spareW = fit.width - rect.width, spareH = fit.height - rect.height
-            if spareW > 1 { project.focusX = min(1, max(0, start.x + g.translation.width / spareW)) }
-            if spareH > 1 { project.focusY = min(1, max(0, start.y + g.translation.height / spareH)) }
+            ForEach(Array(handles.enumerated()), id: \.offset) { _, h in
+                handleShape(edges: h.edges, horizontal: h.horizontal)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+                    .position(h.at)
+                    .gesture(edgeDrag(h.edges, fit: fit))
+                    .cropCursor(h.edges, dragging: areaAtBegin != nil)
+                    .accessibilityElement()
+                    .accessibilityLabel("裁切边")
+            }
+        }
+        .coordinateSpace(name: "stage")
+    }
+
+    /// Dragging the given edges of the crop box: ⇧ keeps the proportions, ⌥ moves the opposite side too.
+    private func edgeDrag(_ edges: [Edge], fit: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .named("stage")).onChanged { g in
+            if areaAtBegin == nil { areaAtBegin = project.area; project.beginEdit() }
+            guard let base = areaAtBegin else { return }
+            // like cropping in Photos / Preview: ⇧ keeps the proportions, ⌥ moves the opposite side too
+            let keys = NSEvent.modifierFlags
+            let next = moved(base, edges: edges, by: CGSize(width: g.translation.width / fit.width,
+                                                            height: g.translation.height / fit.height),
+                             fromCentre: keys.contains(.option), keepShape: keys.contains(.shift))
+            if let next { project.area = next }
         }.onEnded { _ in
-            dragStartFocus = nil
-            project.endEdit("调整取景")
-        })
-        .grabCursor(active: dragStartFocus != nil)
-        .help("拖移以调整取景")
-        .accessibilityElement()
-        .accessibilityLabel("取景框")
-        .accessibilityHint("拖移画面以选择保留的部分")
+            areaAtBegin = nil
+            project.endEdit("裁切画面")
+            // macOS 14: the exit that came during the drag was ignored; the next hover sets the right one again
+            if #unavailable(macOS 15) { NSCursor.arrow.set() }
+        }
+    }
+
+    @ViewBuilder private func handleShape(edges: [Edge], horizontal: Bool?) -> some View {
+        if let horizontal {
+            Capsule().fill(Color.yellow)
+                .frame(width: horizontal ? 22 : 5, height: horizontal ? 5 : 22)
+                .shadow(color: .black.opacity(0.5), radius: 2)
+        } else {
+            // an L bracket pointing into the picture
+            Path { p in
+                let l: CGFloat = 14, c: CGFloat = 14
+                let dx: CGFloat = edges.contains(.left) ? 1 : -1, dy: CGFloat = edges.contains(.top) ? 1 : -1
+                p.move(to: CGPoint(x: c + dx * l, y: c))
+                p.addLine(to: CGPoint(x: c, y: c))
+                p.addLine(to: CGPoint(x: c, y: c + dy * l))
+            }
+            .stroke(Color.yellow, style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+            .shadow(color: .black.opacity(0.5), radius: 2)
+        }
+    }
+
+    /// `base` with the given edges moved by `d` (fractions), at least 10 % each way. `fromCentre` (⌥) moves the
+    /// opposite edges the other way; `keepShape` (⇧) keeps base's proportions, the other side following around the fixed
+    /// corner, or the centre of the edge (both with ⌥). Without either, a side simply stops at the picture's edge; with
+    /// them, a drag past it gives the largest box that still fits, still centred / in proportion (11-18 review: it
+    /// used to stop at the last event that fitted, or drift off centre).
+    private func moved(_ base: CGRect, edges: [Edge], by d: CGSize, fromCentre: Bool, keepShape: Bool) -> CGRect? {
+        let least: CGFloat = 0.1, eps: CGFloat = 1e-6
+        let whole = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let horizontal = edges.contains(.left) || edges.contains(.right)
+        let vertical = edges.contains(.top) || edges.contains(.bottom)
+        func candidate(_ d: CGSize) -> CGRect {
+            // growth of the width and height (the dragged side outwards is positive)
+            var dw: CGFloat = edges.contains(.right) ? d.width : edges.contains(.left) ? -d.width : 0
+            var dh: CGFloat = edges.contains(.bottom) ? d.height : edges.contains(.top) ? -d.height : 0
+            if fromCentre { dw *= 2; dh *= 2 }
+            var w = max(least, base.width + dw), h = max(least, base.height + dh)
+            if keepShape {
+                let ratio = base.width / base.height
+                if horizontal && (!vertical || abs(dw / base.width) >= abs(dh / base.height)) { h = w / ratio } else { w = h * ratio }
+                if w < least { w = least; h = w / ratio }
+                if h < least { h = least; w = h * ratio }
+            }
+            // the fixed side stays, or the centre with ⌥; an edge handle with ⇧ grows about its middle
+            let x: CGFloat = fromCentre || (keepShape && !horizontal) ? base.midX - w / 2
+                : edges.contains(.left) ? base.maxX - w : base.minX
+            let y: CGFloat = fromCentre || (keepShape && !vertical) ? base.midY - h / 2
+                : edges.contains(.top) ? base.maxY - h : base.minY
+            return CGRect(x: x, y: y, width: w, height: h)
+        }
+        func fits(_ r: CGRect) -> Bool {
+            r.minX >= -eps && r.minY >= -eps && r.maxX <= 1 + eps && r.maxY <= 1 + eps
+        }
+        let wanted = candidate(d)
+        if !fromCentre && !keepShape {
+            let r = wanted.intersection(whole)
+            return r.width >= least - eps && r.height >= least - eps ? r : nil
+        }
+        if fits(wanted) { return wanted }
+        // the furthest part of this drag that still fits (the base fits, so there is one)
+        var lo: CGFloat = 0, hi: CGFloat = 1
+        for _ in 0..<24 {
+            let k = (lo + hi) / 2
+            if fits(candidate(CGSize(width: d.width * k, height: d.height * k))) { lo = k } else { hi = k }
+        }
+        let r = candidate(CGSize(width: d.width * lo, height: d.height * lo))
+        return fits(r) ? r : nil
     }
 
     private var thirds: some View {
@@ -832,4 +1017,40 @@ private struct FrameStrip: View {
 private struct StripMetrics: PreferenceKey {
     static let defaultValue: [CGFloat] = []
     static func reduce(value: inout [CGFloat], nextValue: () -> [CGFloat]) { let n = nextValue(); if !n.isEmpty { value = n } }
+}
+
+private extension SourceStage.Edge {
+    @available(macOS 15, *)
+    static func position(_ edges: [Self]) -> FrameResizePosition {
+        switch (edges.contains(.left), edges.contains(.right), edges.contains(.top), edges.contains(.bottom)) {
+        case (true, _, true, _): .topLeading
+        case (_, true, true, _): .topTrailing
+        case (true, _, _, true): .bottomLeading
+        case (_, true, _, true): .bottomTrailing
+        case (true, _, _, _): .leading
+        case (_, true, _, _): .trailing
+        case (_, _, true, _): .top
+        default: .bottom
+        }
+    }
+}
+
+private extension View {
+    /// The system's frame-resize pointer for a crop box edge or corner (arrows pointing the ways it moves, like
+    /// cropping in Photos). macOS 14 has no diagonal one, corners get the crosshair; there the cursor is set rather
+    /// than pushed (overlapping hover areas and views going away unbalanced the stack, 11-18 review) and is left alone
+    /// while a drag is on.
+    @ViewBuilder
+    func cropCursor(_ edges: [SourceStage.Edge], dragging: Bool) -> some View {
+        if #available(macOS 15, *) {
+            self.pointerStyle(.frameResize(position: SourceStage.Edge.position(edges)))
+        } else {
+            self.onHover { inside in
+                guard !dragging else { return }
+                let cursor: NSCursor = edges.count > 1 ? .crosshair
+                    : edges.contains(.left) || edges.contains(.right) ? .resizeLeftRight : .resizeUpDown
+                (inside ? cursor : NSCursor.arrow).set()
+            }
+        }
+    }
 }

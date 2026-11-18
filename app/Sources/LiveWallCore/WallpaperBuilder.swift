@@ -14,6 +14,8 @@ public struct WallpaperRecipe {
     public var aspect: Double
     public var mode: ReframeMode = .squeeze
     public var focus = CGPoint(x: 0.5, y: 0.5)
+    /// The part of the picture kept (fractions of the source), see `Reframe.plan`.
+    public var area = Reframe.wholePicture
     /// Frames held before / after the window (research-notes 一.1: 5 before and 6 after; none after = not animatable).
     public static let defaultLeadFrames = 5
     public static let defaultTailFrames = 6
@@ -75,9 +77,10 @@ public enum WallpaperBuilder {
         if case .unsupported(let why) = source.sourceColor {
             throw EngineError.unsupported("\(why)，目前没有经过验证的转换，不导出以免颜色出错。")
         }
-        let convertColor = source.sourceColor == .sdrBT709                 // Display P3 sources are already in the target space
+        // Display P3 sources are already in the target space; HDR ones are decoded as BT.709 SDR
+        let convertColor = source.sourceColor != .displayP3
         let plan = Reframe.plan(sourceSize: source.size, aspect: recipe.aspect, mode: recipe.mode, focus: recipe.focus,
-                                maxVideoLongSide: recipe.maxVideoLongSide)
+                                area: recipe.area, maxVideoLongSide: recipe.maxVideoLongSide)
 
         progress?("decoding \(recipe.sourceTimes.count) frames")
         let decoded = try await source.frames(at: recipe.sourceTimes)

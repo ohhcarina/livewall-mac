@@ -40,7 +40,7 @@ usage:
   livewall-cli encode <frames dir with f00.png...> <out.mov>   (P3 PNGs -> HEVC, for pipeline tests)
   livewall-cli plan <video> --start S --end E          (prints the 11 times of a decreasing-step window)
   livewall-cli check <video> --times t1,...,t11 [--width W]   (the window checks; W = decode width, default full)
-  livewall-cli build <video> (--times t1,...,tN | --range S,E [--path now|even|even-blend|app|app-smooth] [--blend] [--last-step X]) --aspect A --name NAME --out DIR [--mode squeeze|crop] [--focus X,Y] [--quality Q] [--video-zoom Z] [--max-long-side N] [--cover-quality Q]
+  livewall-cli build <video> (--times t1,...,tN | --range S,E [--path now|even|even-blend|app|app-smooth] [--blend] [--last-step X]) --aspect A --name NAME --out DIR [--mode squeeze|crop] [--focus X,Y] [--area X,Y,W,H] [--quality Q] [--video-zoom Z] [--max-long-side N] [--cover-quality Q]
       --path (with --range; experiments for #0017, default now): now = the App's planner (decreasing steps, calm end);
       even = 11 frames spread evenly over the range; even-blend = even, last frames mixed toward the cover so the
       last step is about --last-step (default 3); --blend mixes the same way on any path
@@ -51,6 +51,7 @@ usage:
   livewall-cli inspect <package.pvt> [--width W]   (window steps, each frame's distance to the cover and the video bitrate,
       measured on the exported video at full size unless W; for comparing device-test packages)
   livewall-cli cover <image.png sRGB-encoded> <out.heic>      (converts to Display P3, writes the HEIC)
+  livewall-cli proxy <video> <out.mov>   (the App's small editing copy; build --proxy PATH plans with one)
 """
 
 let raw = Array(CommandLine.arguments.dropFirst())
@@ -147,10 +148,18 @@ do {
         print("  steps         " + steps.map { String(format: "%5.1f", $0) }.joined())
         print("  dist to cover " + dist.dropLast().map { String(format: "%5.1f", $0) }.joined())
 
+    case "proxy":
+        guard args.positional.count == 2 else { fail(usage) }
+        let source = try await FrameSource(url: URL(fileURLWithPath: args.positional[0]))
+        let t0 = Date()
+        try await ProxyMaker.make(from: source, to: URL(fileURLWithPath: args.positional[1]))
+        print(String(format: "editing copy in %.1f s (worth it: %@)", Date().timeIntervalSince(t0), await ProxyMaker.isWorthIt(source) ? "yes" : "no"))
+
     case "build":
         guard args.positional.count == 1, let aspect = args.double("aspect"),
               let name = args.options["name"], let outDir = args.options["out"] else { fail(usage) }
         let source = try await FrameSource(url: URL(fileURLWithPath: args.positional[0]))
+        if let p = args.options["proxy"] { source.proxy = try await FrameSource(url: URL(fileURLWithPath: p)) }
         var recipe = WallpaperRecipe(sourceTimes: [], aspect: aspect)
         if let m = args.options["mode"] { guard let mode = ReframeMode(rawValue: m) else { fail("--mode squeeze|crop") }; recipe.mode = mode }
         if let l = args.options["max-long-side"] {
@@ -166,11 +175,16 @@ do {
             guard v.count == 2 else { fail("--focus X,Y") }
             recipe.focus = CGPoint(x: v[0], y: v[1])
         }
+        if let a = args.options["area"] {
+            let v = a.split(separator: ",").compactMap { Double($0) }
+            guard v.count == 4 else { fail("--area X,Y,W,H (fractions of the picture)") }
+            recipe.area = CGRect(x: v[0], y: v[1], width: v[2], height: v[3])
+        }
         if let timesArg = args.options["times"] {
             recipe.sourceTimes = timesArg.split(separator: ",").compactMap { Double($0) }
             if args.flags.contains("app-blend") {
                 // the App's tail mixing on given times (to rebuild an App export from its times, 11-11 R7-1)
-                let crop = Reframe.plan(sourceSize: source.size, aspect: aspect, mode: recipe.mode, focus: recipe.focus)
+                let crop = Reframe.plan(sourceSize: source.size, aspect: aspect, mode: recipe.mode, focus: recipe.focus, area: recipe.area)
                     .cropFraction(of: source.size)
                 let frames = try await WindowPlanner.windowFrames(source: source, times: recipe.sourceTimes, crop: crop)
                 recipe.coverBlend = TailBlend.alphas(window: frames, allowed: SegmentPlanner.tailTargets(frames))
@@ -180,7 +194,7 @@ do {
             let v = range.split(separator: ",").compactMap { Double($0) }
             guard v.count == 2 else { fail("--range S,E") }
             // planned on the part that ends up on the wallpaper
-            let crop = Reframe.plan(sourceSize: source.size, aspect: aspect, mode: recipe.mode, focus: recipe.focus)
+            let crop = Reframe.plan(sourceSize: source.size, aspect: aspect, mode: recipe.mode, focus: recipe.focus, area: recipe.area)
                 .cropFraction(of: source.size)
             switch args.options["path"] ?? "now" {
             case "now":

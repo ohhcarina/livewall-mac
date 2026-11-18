@@ -1,11 +1,13 @@
+#if os(macOS)
 import AppKit
+#endif
 import SwiftUI
 
-/// Liquid Glass on macOS 26 and later; the closest material on macOS 14/15 (the app's minimum).
+/// Liquid Glass on macOS / iOS 26 and later; the closest material before (macOS 14/15, iOS 18).
 public extension View {
     @ViewBuilder
     func glassPanel(cornerRadius: CGFloat) -> some View {
-        if #available(macOS 26, *) {
+        if #available(macOS 26, iOS 26, *) {
             self.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
         } else {
             self.background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
@@ -15,7 +17,7 @@ public extension View {
 
     @ViewBuilder
     func glassCapsule() -> some View {
-        if #available(macOS 26, *) {
+        if #available(macOS 26, iOS 26, *) {
             self.glassEffect(.regular, in: .capsule)
         } else {
             self.background(.regularMaterial, in: Capsule())
@@ -24,7 +26,7 @@ public extension View {
 
     @ViewBuilder
     func glassButtonStyle(prominent: Bool = false) -> some View {
-        if #available(macOS 26, *) {
+        if #available(macOS 26, iOS 26, *) {
             if prominent { self.buttonStyle(.glassProminent) } else { self.buttonStyle(.glass) }
         } else {
             if prominent { self.buttonStyle(.borderedProminent) } else { self.buttonStyle(.bordered) }
@@ -32,6 +34,7 @@ public extension View {
     }
 }
 
+#if os(macOS)
 /// Pointer shapes: the system ones on macOS 15+, NSCursor on 14 (only while hovering, never popped mid-drag).
 public extension View {
     @ViewBuilder
@@ -54,3 +57,4 @@ public extension View {
         }
     }
 }
+#endif

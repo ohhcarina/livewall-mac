@@ -1,6 +1,13 @@
 import CoreGraphics
-import SharedUI
 import SwiftUI
+
+/// How the lock screen plays (docs/research-notes.md 一.2).
+public enum LockScreen {
+    /// The 10 frames before the cover play forward in about this long.
+    public static let playSeconds = 0.75
+    /// Before that, the screen goes from the cover to the first frame in about this long.
+    public static let returnSeconds = 0.35
+}
 
 /// Imitates how the lock screen plays the 10 frames before the cover (docs/research-notes.md 一.2): forward once from
 /// the first frame in about 0.75 s, fast first and slowing down, with neighbouring frames blended, then it rests on
@@ -9,13 +16,24 @@ import SwiftUI
 /// Before it, the screen goes from the cover to the first frame in ~0.35 s, drawn as a fade: the timecode test showed
 /// numbers only counting up, so a frame-by-frame rewind is not what people see (an earlier version drew one, and moving
 /// content looked like it went back and forth).
-struct LockSimView: View {
+public struct LockSimView: View {
     let frames: [CGImage]
     let aspect: Double
     /// Changing it plays the animation again.
     var replayToken = 0
     /// Rest on the cover and do not replay while the cover is being scrubbed (each scrubbed picture is a new frame).
     var holdOnCover = false
+    /// Show the 点按重播 hint while the pointer is over it (off while a window is being recorded). On a touch screen
+    /// there is no hover, so the hint is always shown there.
+    var showsHoverHint = true
+
+    public init(frames: [CGImage], aspect: Double, replayToken: Int = 0, holdOnCover: Bool = false, showsHoverHint: Bool = true) {
+        self.frames = frames
+        self.aspect = aspect
+        self.replayToken = replayToken
+        self.holdOnCover = holdOnCover
+        self.showsHoverHint = showsHoverHint
+    }
     @State private var startDate = Date()
     /// Only while the animation plays: a resting preview must not redraw every frame (energy use while idle).
     @State private var running = true
@@ -25,7 +43,7 @@ struct LockSimView: View {
     private let back = LockScreen.returnSeconds
     private let forward = LockScreen.playSeconds
 
-    var body: some View {
+    public var body: some View {
         GeometryReader { geo in
             let short = min(geo.size.width, geo.size.height)
             let bezel = max(4, short * 0.022)
@@ -47,13 +65,13 @@ struct LockSimView: View {
                     .font(.callout.weight(.medium)).padding(.horizontal, 12).padding(.vertical, 7)
                     .glassCapsule()
                     .padding(.bottom, bezel + short * 0.05)
-                    .opacity(hovering ? 1 : 0)
+                    .opacity(hintVisible ? 1 : 0)
                     .animation(.easeOut(duration: 0.2), value: hovering)
                     .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
             .onTapGesture { replay() }
-            .onHover { hovering = $0 && !SnapshotHook.scripted }
+            .onHover { hovering = $0 && showsHoverHint }
             .accessibilityElement()
             .accessibilityLabel("锁屏预览")
             .accessibilityAddTraits(.isButton)
@@ -72,6 +90,14 @@ struct LockSimView: View {
     }
 
     private func replay() { startDate = Date() }
+
+    private var hintVisible: Bool {
+        #if os(iOS)
+        return showsHoverHint && !running
+        #else
+        return hovering
+        #endif
+    }
 
     private func clock(short: CGFloat) -> some View {
         VStack(spacing: -short * 0.01) {

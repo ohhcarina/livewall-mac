@@ -25,7 +25,10 @@ struct FitPicker: View {
         let strip = project.filmstrip
         guard !strip.isEmpty, project.duration > 0 else { return nil }
         let i = Int((project.rangeEnd / project.duration * Double(strip.count - 1)).rounded())
-        return strip[min(max(0, i), strip.count - 1)]
+        let image = strip[min(max(0, i), strip.count - 1)]
+        // only the kept part (the crop box), like the wallpaper
+        let kept = Reframe.areaRect(project.area, in: CGSize(width: image.width, height: image.height))
+        return image.cropping(to: kept) ?? image
     }
 
     /// The picture says what each does; the words stay in the tooltip and for VoiceOver.
@@ -53,7 +56,7 @@ struct FitPicker: View {
     }
 
     private var sourceAspect: Double {
-        guard let s = project.source?.size, s.height > 0 else { return 16.0 / 9.0 }
+        guard let s = project.areaSize, s.height > 0 else { return 16.0 / 9.0 }
         return s.width / s.height
     }
 }

@@ -12,7 +12,11 @@ public enum SourceColor: Equatable {
     case sdrBT709
     /// SDR that is already Display P3: kept as it is, no conversion.
     case displayP3
-    /// HDR (PQ / HLG), BT.2020, DCI-P3 ...: no tested conversion, the export is refused instead of coming out wrong.
+    /// HDR (PQ / HLG, Dolby Vision 8.4 as iPhones record it): the decoder tone-maps it to SDR BT.709 (the system's own
+    /// mapping), from there it goes the `sdrBT709` way. A wallpaper stays SDR: HDR video on the lock screen steps in
+    /// brightness at the hand-overs (docs/research-notes.md 一.7). The string says what it is, for the interface.
+    case hdr(String)
+    /// SDR BT.2020, DCI-P3 ...: no tested conversion, the export is refused instead of coming out wrong.
     case unsupported(String)
 }
 
@@ -20,6 +24,10 @@ public final class FrameSource {
     public let url: URL
     public let asset: AVURLAsset
     let track: AVAssetTrack
+    /// A small copy of this video (`ProxyMaker`): small decodes come from it, full-size ones from the original. Only
+    /// used for requests at most half its width, where its compression is scaled away (11-18), and never for the
+    /// measurements the device rules were calibrated on (`frames(fromProxy: false)`).
+    public var proxy: FrameSource?
     /// Presentation duration of the video track in seconds.
     public let duration: Double
     /// Frames per second of the source (nominal).
@@ -27,7 +35,7 @@ public final class FrameSource {
     /// Displayed size in pixels (rotation applied).
     public let size: CGSize
     /// Clockwise quarter turns that bring the stored frames upright (portrait phone videos are stored sideways).
-    let quarterTurns: Int
+    public let quarterTurns: Int
     private let naturalSize: CGSize
     public let sourceColor: SourceColor
 
@@ -62,7 +70,7 @@ public final class FrameSource {
         let hdrTransfers: Set<String> = [kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String,
                                          kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String]
         if let transfer, hdrTransfers.contains(transfer) {
-            return .unsupported("这是 HDR 视频（PQ / HLG，含杜比视界）")
+            return .hdr(transfer == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String) ? "HLG" : "PQ")
         }
         guard let primaries = tag(kCMFormatDescriptionExtension_ColorPrimaries) else { return .sdrBT709 }
         let sdr709: Set<String> = [kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String, kCMFormatDescriptionColorPrimaries_SMPTE_C as String,
@@ -72,9 +80,21 @@ public final class FrameSource {
         return .unsupported("视频的色域是 \(primaries)（不是 BT.709 或 Display P3）")
     }
 
+    private func proxyFor(_ width: Int?) -> FrameSource? {
+        guard let proxy, let width, Double(width) * 2 <= Double(proxy.size.width) else { return nil }
+        return proxy
+    }
+
     /// Decoder output settings; `width` is the wanted width of the UPRIGHT frame (nil = full resolution).
     private func decoderSettings(width: Int?) -> [String: Any] {
         var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBALE]
+        if case .hdr = sourceColor {
+            // asking for SDR BT.709 makes the decoder tone-map (VideoToolbox's HDR → SDR, as AVFoundation shows HDR
+            // on an SDR screen); without it the frames are the raw HLG / PQ code values
+            settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                                                  AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                                                  AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
+        }
         if let width {
             let f = Double(width) / Double(size.width)
             settings[kCVPixelBufferWidthKey as String] = max(2, Int((Double(naturalSize.width) * f).rounded()))
@@ -89,9 +109,12 @@ public final class FrameSource {
 
     /// The frame shown at each time (frame with PTS <= t < PTS + duration; times at or beyond the end give the last
     /// frame). Results are in the order of `times`, decoded to 16-bit RGB with the source's own YCbCr matrix and no
-    /// transfer-curve change.
+    /// transfer-curve change (HDR sources: tone-mapped to SDR BT.709 first).
     /// `width`: let the decoder scale the frames to this width (previews); nil = full resolution.
-    public func frames(at times: [Double], width: Int? = nil) async throws -> [RGB16Image] {
+    /// `fromProxy: false` for measurements that decide what the phone does (`WindowPlanner.windowFrames`): fine texture
+    /// reads lower on the copy (11-18: steps up to 1.7 apart at 544 wide), and those numbers are calibrated on originals.
+    public func frames(at times: [Double], width: Int? = nil, fromProxy: Bool = true) async throws -> [RGB16Image] {
+        if fromProxy, let proxy = proxyFor(width) { return try await proxy.frames(at: times, width: width) }
         guard let lo = times.min(), let hi = times.max() else { return [] }
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: decoderSettings(width: width))
@@ -136,6 +159,9 @@ public final class FrameSource {
     /// them to `width` pixels wide; `transform` (e.g. a crop) runs on each as it is decoded, so only its result is kept.
     public func thumbnails(from start: Double, to end: Double, fps: Double, width: Int,
                            transform: (RGB16Image) throws -> RGB16Image = { $0 }) async throws -> [(time: Double, image: RGB16Image)] {
+        if let proxy = proxyFor(width) {
+            return try await proxy.thumbnails(from: start, to: end, fps: fps, width: width, transform: transform)
+        }
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: decoderSettings(width: width))
         output.alwaysCopiesSampleData = false

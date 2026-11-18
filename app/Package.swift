@@ -10,9 +10,10 @@ let realSDK: [LinkerSetting] = [.unsafeFlags(["-Xlinker", "-platform_version", "
 
 let package = Package(
     name: "LiveWall",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v18)],
     products: [
         .library(name: "LiveWallCore", targets: ["LiveWallCore"]),
+        .library(name: "SharedUI", targets: ["SharedUI"]),
         .executable(name: "livewall-cli", targets: ["livewall-cli"]),
         .executable(name: "LiveWall", targets: ["LiveWall"]),
     ],

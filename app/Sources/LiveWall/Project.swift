@@ -1,9 +1,12 @@
 import AVFoundation
 import AppKit
 import CoreGraphics
+import CoreImage
+import CryptoKit
 import Foundation
 import LiveWallCore
 import Observation
+import SharedUI
 
 /// Everything the window shows: the source, the chosen range, the planned frames and their checks.
 @MainActor
@@ -181,6 +184,12 @@ final class Project {
         }
     }
 
+    /// What the pictures on the timeline are taken from (the editing copy once there is one).
+    var previewAsset: AVAsset? { source?.proxy?.asset ?? source?.asset }
+    /// While the editing copy is made on import: how far along (0...1); nil otherwise.
+    var proxyProgress: Double?
+    private var proxyGeneration = 0
+
     /// One answer for the toolbar button and the menu item.
     var canExport: Bool { source != nil && !isBusy && !frames.isEmpty && blockedReason == nil }
 
@@ -229,6 +238,14 @@ final class Project {
     }
     var focusX: Double = 0.5 { didSet { if oldValue != focusX { replan() } } }
     var focusY: Double = 0.5 { didSet { if oldValue != focusY { replan() } } }
+    /// The part of the picture kept at all (fractions of the source), set with the crop box in the video view (11-18:
+    /// 「上下有黑边……没办法裁剪」). 完整 fits this part to the screen, 铺满 frames inside it.
+    var area: CGRect = Reframe.wholePicture { didSet { if oldValue != area { replan() } } }
+    /// Displayed size of the kept part, in source pixels.
+    var areaSize: CGSize? {
+        guard let s = source?.size else { return nil }
+        return Reframe.areaRect(area, in: s).size
+    }
 
     // results
     var times: [Double] = []
@@ -242,46 +259,122 @@ final class Project {
     /// The earliest start before it turns from 略有跳动 into 跳动明显 (same cover and crop as `smoothStart`), for the colour
     /// bar under the start row. Found after the plan, so it never delays the preview.
     var jumpyStart: Double?
+    /// The cover that `smoothStart`, `jumpyStart` and `times` were worked out for; nil while a new cover's are. The trim
+    /// bar compares it with `rangeEnd` to know when what it shows of them is stale (11-18 review: one place for
+    /// dragging, waiting for the plan and a failed plan).
+    var answeredCover: Double?
+    var answersAreStale: Bool { answeredCover != rangeEnd }
 
-    /// While the cover is dragged in the lock-screen view: the source frame under the pointer, framed like the
-    /// wallpaper, shown on the lock screen instead of switching to the video view (11-12: the view switch jumped).
-    var scrubCover: CGImage?
-    /// The cover is being dragged in the lock-screen view: the preview rests on the cover and does not replay. Tied
-    /// to the drag, not to `scrubCover`, which can outlive it (11-12 review).
-    var isScrubbingCover = false
-    private var scrubTask: Task<Void, Never>?
+    /// While the cover or the start is dragged in the lock-screen view: the source frame under the pointer, framed like
+    /// the wallpaper, shown on the lock screen instead of switching to the video view (11-12: the view switch jumped;
+    /// 11-18: dragging the start showed only the cover, 「预览窗口无法看到起点的画面」).
+    var scrubFrame: CGImage?
+    /// A trim handle is being dragged in the lock-screen view: the preview rests on `scrubFrame` and does not replay.
+    /// Tied to the drag, not to `scrubFrame`, which can outlive it (11-12 review).
+    var isScrubbing = false
     private var scrubPending: Double?
-    /// Bumped when a scrub ends, so a decode still running then cannot put its picture back (11-12 review).
+    /// The time of the last picture put on the lock screen this drag.
+    private var scrubShown: Double?
+    private var scrubSeeking = false
+    /// Bumped when a scrub ends, so a seek still running then cannot put its picture back (11-12 review).
     private var scrubGeneration = 0
+    private var scrubOutput: AVPlayerItemVideoOutput?
+    /// No colour management: the plan's frames keep the decoded values and are only labelled sRGB, so the scrubbed
+    /// picture must not be converted either, or the cover shifts colour on release (11-18 review).
+    private nonisolated static let scrubContext = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
 
-    /// Shows the frame at `t` as the cover; requests while one is decoding collapse into the latest.
-    func scrubCover(at t: Double) {
+    /// Shows the frame at `t` on the lock screen. Seeks the player that is already open (hardware decoding, one seek at
+    /// a time, the latest request wins), like Photos scrubbing: 11-18 a new reader per position took 0.2–0.4 s a frame
+    /// on a 4K AV1 trailer with keyframes seconds apart, and dragging felt stuck (「很卡」).
+    func scrub(at t: Double) {
+        isScrubbing = true
+        // frame by frame, most pointer events land on the frame already shown: seeking there again only waits
+        if t == scrubShown, !scrubSeeking { return }
         scrubPending = t
-        isScrubbingCover = true
-        guard scrubTask == nil else { return }
-        let generation = scrubGeneration
-        scrubTask = Task { [weak self] in
-            while let self, self.scrubGeneration == generation, let t = self.scrubPending, let source = self.source {
-                self.scrubPending = nil
-                guard let decoded = try? await source.frames(at: [t], width: 480), let first = decoded.first else { break }
-                let plan = Reframe.plan(sourceSize: CGSize(width: first.width, height: first.height), aspect: self.aspect,
-                                        mode: self.mode, focus: CGPoint(x: self.focusX, y: self.focusY))
-                let image = try? await Task.detached(priority: .userInitiated) {
-                    try Self.previews(decoded, plan: plan, blend: [0])
-                }.value.first
-                if self.scrubGeneration == generation, let image { self.scrubCover = image }
+        if !scrubSeeking { chaseScrub() }
+    }
+
+    private func chaseScrub() {
+        guard let player, let item = player.currentItem, let t = scrubPending, let source else { scrubSeeking = false; return }
+        scrubPending = nil
+        scrubSeeking = true
+        let output: AVPlayerItemVideoOutput
+        if let existing = scrubOutput, item.outputs.contains(existing) {
+            output = existing
+        } else {
+            // attached only while scrubbing (`endScrub` removes it): playback would otherwise convert every frame for it
+            var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            if case .hdr = source.sourceColor {
+                // tone-mapped to SDR BT.709 like the plan's frames (`FrameSource.decoderSettings`), or HLG / PQ code
+                // values show washed out while dragging and jump on release (11-18 re-review)
+                settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                                                      AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                                                      AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
             }
-            if self?.scrubGeneration == generation { self?.scrubTask = nil }
+            output = AVPlayerItemVideoOutput(outputSettings: settings)
+            item.add(output)
+            scrubOutput = output
+        }
+        let generation = scrubGeneration
+        let target = CMTime(seconds: t, preferredTimescale: 600)
+        let turns = source.quarterTurns
+        let framing = (aspect: aspect, mode: mode, focus: CGPoint(x: focusX, y: focusY), area: area)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard let self else { return }
+                if finished, self.scrubGeneration == generation, let buffer = await Self.waitForFrame(output, at: target) {
+                    let image = await Task.detached(priority: .userInitiated) {
+                        Self.scrubPicture(buffer, quarterTurns: turns, aspect: framing.aspect, mode: framing.mode, focus: framing.focus,
+                                          area: framing.area)
+                    }.value
+                    if self.scrubGeneration == generation, let image { self.scrubFrame = image; self.scrubShown = t }
+                }
+                self.scrubSeeking = false
+                self.chaseScrub()                   // whatever came in meanwhile, from this drag or the next one
+            }
         }
     }
 
-    /// The drag ended: the scrubbed picture stays until the new plan shows the real one (or goes now if nothing moved).
-    func endScrub(coverMoved: Bool) {
+    /// A paused player hands the frame to the output a moment after the seek; far from a keyframe in 4K that can take
+    /// a while, so wait up to about a quarter of a second rather than drop the last position of a drag.
+    private static func waitForFrame(_ output: AVPlayerItemVideoOutput, at time: CMTime) async -> CVPixelBuffer? {
+        for _ in 0..<30 {
+            if let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) { return buffer }
+            try? await Task.sleep(for: .milliseconds(8))
+        }
+        return nil
+    }
+
+    /// The frame upright (the buffer is as stored, before the track's rotation), cropped and squeezed like the
+    /// wallpaper preview, 480 wide like the plan's frames. Off the main thread.
+    private nonisolated static func scrubPicture(_ buffer: CVPixelBuffer, quarterTurns: Int, aspect: Double, mode: ReframeMode,
+                                                 focus: CGPoint, area: CGRect) -> CGImage? {
+        let orientation: CGImagePropertyOrientation = [.up, .right, .down, .left][((quarterTurns % 4) + 4) % 4]
+        var image = CIImage(cvPixelBuffer: buffer).oriented(orientation)
+        image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
+        let w = image.extent.width, h = image.extent.height
+        let plan = Reframe.plan(sourceSize: CGSize(width: w, height: h), aspect: aspect, mode: mode, focus: focus, area: area)
+        let crop = plan.cropRect                                       // top-left origin; Core Image counts from the bottom
+        let outW = 480.0, outH = (outW * Double(plan.coverSize.height) / Double(plan.coverSize.width)).rounded()
+        let framed = image
+            .cropped(to: CGRect(x: crop.minX, y: h - crop.maxY, width: crop.width, height: crop.height))
+            .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -(h - crop.maxY)))
+            .transformed(by: CGAffineTransform(scaleX: outW / crop.width, y: outH / crop.height))
+        return scrubContext.createCGImage(framed, from: CGRect(x: 0, y: 0, width: outW, height: outH),
+                                          format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+    }
+
+    /// The drag ended: a moved cover's picture stays until the new plan shows the real one; otherwise it goes now.
+    func endScrub(keepPicture: Bool) {
         scrubGeneration += 1
-        scrubTask = nil
         scrubPending = nil
-        isScrubbingCover = false
-        if !coverMoved { scrubCover = nil }
+        scrubShown = nil
+        isScrubbing = false
+        if let output = scrubOutput {
+            player?.currentItem?.remove(output)
+            scrubOutput = nil
+        }
+        if !keepPicture { scrubFrame = nil }
     }
     private var smoothKey: SmoothKey?
     private struct SmoothKey: Equatable { var cover: Double; var crop: CGRect }
@@ -308,37 +401,24 @@ final class Project {
         if defaults.double(forKey: "customHeight") >= 100 { customHeight = defaults.double(forKey: "customHeight") }
     }
 
-    /// Many clips fade out to black (some over their whole length), which would make a black wallpaper. When the last
-    /// frame is dark next to the brightest of the last 30 s, the default cover is the last frame still at half that
-    /// brightness. Clips without a fade keep their last frame.
-    private static func endBeforeFadeOut(_ src: FrameSource) async -> Double {
-        let d = src.duration
-        guard let thumbs = try? await src.thumbnails(from: max(0, d - 30), to: d, fps: 4, width: 48), !thumbs.isEmpty else { return d }
-        let luma = thumbs.map { t -> (time: Double, value: Double) in
-            let p = t.image.pixels
-            var sum = 0.0
-            for i in stride(from: 0, to: p.count, by: 4) { sum += Double(p[i]) + Double(p[i + 1]) + Double(p[i + 2]) }
-            return (t.time, sum / Double(p.count / 4 * 3) / 257)
-        }
-        let peak = luma.map(\.value).max() ?? 0
-        guard let last = luma.last, peak > 24, last.value < min(30, peak * 0.35) else { return d }
-        return luma.last(where: { $0.value >= peak * 0.5 })?.time ?? d
-    }
-
     // MARK: undo
 
     /// The window's undo manager (set by the view).
     var undoManager: UndoManager?
     private var editStart: Edit?
+    /// The range or crop changed during an edit: plan once it ends. Planning while dragging decoded alongside the
+    /// scrubbing and slowed both (11-18 「很卡」); the colour bar and the feel update on release, like Photos' trim.
+    private var replanAfterEdit = false
 
     /// What a trim or crop drag changes.
     struct Edit: Equatable {
         var rangeStart, rangeEnd, focusX, focusY: Double
+        var area: CGRect
         var startIsAuto: Bool
     }
 
     private var edit: Edit {
-        Edit(rangeStart: rangeStart, rangeEnd: rangeEnd, focusX: focusX, focusY: focusY, startIsAuto: startIsAuto)
+        Edit(rangeStart: rangeStart, rangeEnd: rangeEnd, focusX: focusX, focusY: focusY, area: area, startIsAuto: startIsAuto)
     }
 
     private func registerUndo(_ name: String, _ undo: @escaping (Project) -> Void) {
@@ -350,7 +430,7 @@ final class Project {
     private func apply(_ e: Edit, name: String) {
         let current = edit
         startIsAuto = e.startIsAuto
-        rangeStart = e.rangeStart; rangeEnd = e.rangeEnd; focusX = e.focusX; focusY = e.focusY
+        rangeStart = e.rangeStart; rangeEnd = e.rangeEnd; focusX = e.focusX; focusY = e.focusY; area = e.area
         registerUndo(name) { $0.apply(current, name: name) }
     }
 
@@ -360,20 +440,21 @@ final class Project {
     func endEdit(_ name: String) {
         guard let before = editStart else { return }
         editStart = nil
+        if replanAfterEdit { replanAfterEdit = false; replan(immediately: true) }
         guard before != edit else { return }
         registerUndo(name) { $0.apply(before, name: name) }
     }
 
     /// How much squeezing distorts this source on this screen: 0 = none, 0.4 = squashed by 40 %.
     var squeezeDistortion: (amount: Double, horizontal: Bool) {
-        guard let size = source?.size, size.height > 0 else { return (0, true) }
-        let r = aspect / (size.width / size.height)
-        return (1 - min(r, 1 / r), r < 1)
+        guard let size = areaSize else { return (0, true) }
+        return AutoChoices.squeezeDistortion(sourceSize: size, aspect: aspect)
     }
 
     /// Fit the picture the way that looks right: squeeze only when it barely distorts.
     private func chooseFit() {
-        mode = squeezeDistortion.amount > 0.15 ? .crop : .squeeze
+        guard let size = areaSize else { return }
+        mode = AutoChoices.fit(sourceSize: size, aspect: aspect)
     }
 
     var aspect: Double {
@@ -399,15 +480,30 @@ final class Project {
         guard !isExporting else { return }          // dropped or opened while an export is running: ignore, never swap the source under it
         // the last video asked for wins: an earlier open still loading must not write its source, range or pictures later
         openTask?.cancel()
+        proxyGeneration += 1                // the cancelled import's progress updates no longer count
+        let generation = proxyGeneration
+        proxyProgress = nil
         planTask?.cancel()
-        endScrub(coverMoved: false)
+        endScrub(keepPicture: false)
+        scrubSeeking = false                // a seek on the old player may never call back
+        // a drag cut off without its end (gesture cancelled) must not hold back this video's plans
+        editStart = nil
+        replanAfterEdit = false
         phase = .loading
         lastExport = nil
         openTask = Task {
             do {
                 let src = try await FrameSource(url: url)
-                if src.duration < 1.5 { throw EngineError.invalid("视频过短（\(String(format: "%.1f", src.duration)) 秒），需要至少 1.5 秒。") }
-                let end = await Self.endBeforeFadeOut(src)
+                try AutoChoices.checkDuration(src)
+                do {
+                    try await attachProxy(to: src, generation: generation)
+                } catch {
+                    if Task.isCancelled { throw CancellationError() }
+                    // the copy only makes editing lighter: without it, edit the original (11-18 review)
+                    if proxyGeneration == generation { proxyProgress = nil }
+                    src.proxy = nil
+                }
+                let end = await AutoChoices.coverBeforeFadeOut(src)
                 // everything from here to `replan` happens at once, with no await in between
                 guard !Task.isCancelled else { return }
                 source = src
@@ -426,25 +522,78 @@ final class Project {
                 startIsAuto = true
                 smoothStart = nil
                 jumpyStart = nil
+                answeredCover = nil
                 smoothKey = nil
                 focusX = 0.5; focusY = 0.5
+                area = Reframe.wholePicture
                 chooseFit()
                 suppressReplan = false
                 undoManager?.removeAllActions()
-                installPlayer(url)
+                installPlayer(src.proxy?.url ?? url)          // scrubbing and playback on the editing copy
                 seek(to: rangeStart)
                 viewMode = .lockScreen
                 phase = .ready
                 replan(immediately: true)
                 filmstrip = []
-                let strip = await Self.filmstrip(of: src.asset, to: src.duration)
+                let strip = await PreviewImages.filmstrip(of: src.proxy?.asset ?? src.asset, to: src.duration)
                 guard !Task.isCancelled else { return }        // a cancelled run returns [], which would blank the newer strip
                 filmstrip = strip
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else { return }          // a newer open owns the progress bar now
+                proxyProgress = nil
                 phase = .failed(Self.describe(error, fallback: "无法打开这个视频。文件可能已损坏，或者格式不受支持。"))
             }
         }
+    }
+
+    /// Large or slow-to-decode videos get a small editing copy (`ProxyMaker`), made once and kept in Caches keyed by the
+    /// file's path, size and date (11-18, 「导入可以久一些」: ~6 s for a 90 s 4K AV1 trailer, then every edit is light).
+    private func attachProxy(to src: FrameSource, generation: Int) async throws {
+        guard await ProxyMaker.isWorthIt(src) else { return }
+        try Task.checkCancellation()
+        let fm = FileManager.default
+        let folder = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("LiveWall/EditingCopies")
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let attributes = try? fm.attributesOfItem(atPath: src.url.path)
+        let key = "v\(ProxyMaker.version)|\(src.url.standardizedFileURL.path)|\(attributes?[.size] ?? 0)|\((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        let name = SHA256.hash(data: Data(key.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        let copy = folder.appendingPathComponent(name + ".mov")
+        // the progress bar belongs to the newest import only (`proxyGeneration` is bumped by `open`)
+        let current = { [weak self] in self?.proxyGeneration == generation }
+        if !fm.fileExists(atPath: copy.path) {
+            if current() { proxyProgress = 0 }
+            // its own name: the same video reopened while a copy is being made must not share (and delete) the file
+            let partial = folder.appendingPathComponent(name + "-" + UUID().uuidString + ".partial")
+            defer { try? fm.removeItem(at: partial) }
+            try await ProxyMaker.make(from: src, to: partial) { p in
+                Task { @MainActor [weak self] in
+                    if let self, self.proxyGeneration == generation, self.proxyProgress != nil { self.proxyProgress = p }
+                }
+            }
+            try Task.checkCancellation()
+            try? fm.removeItem(at: copy)
+            try fm.moveItem(at: partial, to: copy)
+            Self.pruneCopies(in: folder, keeping: copy)
+        } else {
+            try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: copy.path)   // recently used
+        }
+        if current() { proxyProgress = nil }
+        do {
+            src.proxy = try await FrameSource(url: copy)
+        } catch {
+            try? fm.removeItem(at: copy)        // a broken copy (disk full, cut short) is made again next time
+            throw error
+        }
+    }
+
+    /// Keeps the 8 most recently used copies (a 90 s 4K video makes about 40 MB).
+    private static func pruneCopies(in folder: URL, keeping current: URL) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        let dated = files.filter { $0.pathExtension == "mov" && $0 != current }.map {
+            ($0, (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+        }.sorted { $0.1 > $1.1 }
+        for (url, _) in dated.dropFirst(7) { try? fm.removeItem(at: url) }
     }
 
     private func installPlayer(_ url: URL) {
@@ -464,22 +613,6 @@ final class Project {
     }
 
     /// `count` pictures spread evenly over `start ... end` (the whole video, or the trim bar's zoomed window).
-    static func filmstrip(of asset: AVAsset, from start: Double = 0, to end: Double, count: Int = 24) async -> [CGImage] {
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 240, height: 240)
-        let slack = CMTime(seconds: min(0.5, (end - start) / Double(count) / 2), preferredTimescale: 600)
-        generator.requestedTimeToleranceBefore = slack
-        generator.requestedTimeToleranceAfter = slack
-        var images: [CGImage] = []
-        for i in 0..<count {
-            if Task.isCancelled { return [] }
-            let t = start + (end - start) * (Double(i) + 0.5) / Double(count)
-            if let image = try? await generator.image(at: CMTime(seconds: t, preferredTimescale: 600)).image { images.append(image) }
-        }
-        return images
-    }
-
     func seek(to seconds: Double) {
         let t = min(max(0, seconds), duration)
         player?.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
@@ -517,10 +650,13 @@ final class Project {
 
     func setEndToPlayhead() { beginEdit(); moveCover(to: playhead); endEdit("设定封面") }
 
-    /// Moves the cover; while the start is automatic it moves along (keeping the span) until the new plan finds it.
-    func moveCover(to t: Double) {
-        let cover = min(duration, max(t, startIsAuto ? minSpan : rangeStart + minSpan))
-        if startIsAuto { rangeStart = max(0, cover - span) }
+    /// Moves the cover. `keeping` a span (dragging the cover, 11-18: 「拖动封面应该是固定时长整块移动吧」) moves the start
+    /// along with it, set by hand or not; otherwise (the O key, VoiceOver) a start set by hand stays, like an out point.
+    /// An automatic start always moves along until the new plan finds it.
+    func moveCover(to t: Double, keeping span: Double? = nil) {
+        let follows = startIsAuto || span != nil
+        let cover = min(duration, max(t, follows ? minSpan : rangeStart + minSpan))
+        if follows { rangeStart = max(0, cover - max(minSpan, span ?? self.span)) }
         rangeEnd = cover
     }
 
@@ -537,7 +673,7 @@ final class Project {
     /// The crop window in the source, as fractions of its width and height (the whole picture when squeezing).
     var cropFraction: CGRect {
         guard let source else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
-        return Reframe.plan(sourceSize: source.size, aspect: aspect, mode: mode, focus: CGPoint(x: focusX, y: focusY))
+        return Reframe.plan(sourceSize: source.size, aspect: aspect, mode: mode, focus: CGPoint(x: focusX, y: focusY), area: area)
             .cropFraction(of: source.size)
     }
 
@@ -546,6 +682,7 @@ final class Project {
     func replan(immediately: Bool = false) {
         guard source != nil, !suppressReplan else { return }
         if isExporting { needsReplan = true; return }
+        if editStart != nil { replanAfterEdit = true; planTask?.cancel(); return }
         notice = nil
         planTask?.cancel()
         planTask = Task { [weak self] in
@@ -553,16 +690,6 @@ final class Project {
             guard !Task.isCancelled else { return }
             await self?.runPlan()
         }
-    }
-
-    /// The pictures as they will play: cropped like the wallpaper and mixed toward the cover like the export.
-    nonisolated private static func previews(_ decoded: [RGB16Image], plan: ReframePlan, blend: [Double]) throws -> [CGImage] {
-        var previews = try decoded.map {
-            try $0.resized(width: plan.coverSize.width, height: plan.coverSize.height, crop: plan.cropRect)
-        }
-        try TailBlend.apply(&previews, alphas: blend)
-        let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        return previews.compactMap { $0.makeCGImage(colorSpace: space) }
     }
 
     private func runPlan() async {
@@ -573,9 +700,16 @@ final class Project {
         planFailed = nil
         do {
             let cover = min(rangeEnd, source.duration), crop = cropFraction
+            let chosenCover = rangeEnd
             let key = SmoothKey(cover: cover, crop: crop)
             let newCover = smoothKey != key
             if newCover {
+                // the old cover's answers would sit in the wrong place on the colour bar meanwhile; and forget whose
+                // they were, or a cancelled run here would leave them nil for good when that cover comes back (undo)
+                smoothStart = nil
+                jumpyStart = nil
+                smoothKey = nil
+                answeredCover = nil
                 let found = try await SegmentPlanner.smoothestStart(source: source, cover: cover, crop: crop)
                 try Task.checkCancellation()
                 smoothStart = found
@@ -594,17 +728,17 @@ final class Project {
             let decoded = try await source.frames(at: planned.times, width: width)
             try Task.checkCancellation()
             let plan = Reframe.plan(sourceSize: CGSize(width: decoded[0].width, height: decoded[0].height), aspect: aspect, mode: mode,
-                                    focus: CGPoint(x: focusX, y: focusY))
+                                    focus: CGPoint(x: focusX, y: focusY), area: area)
             // resizing and the checks are pixel loops: off the main thread, so dragging stays smooth
             let images = try await Task.detached(priority: .userInitiated) {
-                try Self.previews(decoded, plan: plan, blend: planned.blend)
+                try PreviewImages.wallpaper(decoded, plan: plan, blend: planned.blend)
             }.value
             try Task.checkCancellation()
             times = planned.times
             blend = planned.blend
             feel = planned.feel
             frames = images
-            scrubCover = nil                    // the plan's own cover from now on (a drag still going puts its picture back)
+            scrubFrame = nil                    // the plan's own cover from now on (a drag still going puts its picture back)
             report = planned.report
             if phase == .planning { phase = .ready }
             if newCover || jumpyStart == nil {
@@ -613,11 +747,13 @@ final class Project {
                 try Task.checkCancellation()
                 jumpyStart = min(jumpy, smoothStart ?? jumpy)
             }
+            answeredCover = chosenCover
         } catch is CancellationError {
             return
         } catch {
             // keep whatever was shown before; the sidebar offers to try again
-            scrubCover = nil
+            scrubFrame = nil
+            answeredCover = rangeEnd            // nothing more is coming for this cover: stop waiting for it
             planFailed = Self.describe(error, fallback: "无法分析这一段视频。")
             phase = .ready
         }
@@ -649,6 +785,7 @@ final class Project {
             var recipe = WallpaperRecipe(sourceTimes: self.times, aspect: self.aspect)
             recipe.mode = self.mode
             recipe.focus = CGPoint(x: self.focusX, y: self.focusY)
+            recipe.area = self.area
             recipe.coverBlend = self.blend
             do {
                 let result = try await WallpaperBuilder.build(source: source, recipe: recipe, name: name, outputDirectory: directory) { [weak self] step in
@@ -664,12 +801,4 @@ final class Project {
             if self.needsReplan { self.needsReplan = false; self.replan(immediately: true) }
         }
     }
-}
-
-/// How the lock screen plays (docs/research-notes.md 一.2).
-enum LockScreen {
-    /// The 10 frames before the cover play forward in about this long.
-    static let playSeconds = 0.75
-    /// Before that, the screen goes from the cover to the first frame in about this long.
-    static let returnSeconds = 0.35
 }

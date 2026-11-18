@@ -67,4 +67,23 @@ final class ReframeTests: XCTestCase {
         XCTAssertEqual(z.midX, full.midX)
         XCTAssertEqual(z.midY, full.midY)
     }
+
+    /// The kept area (11-18: a 4K trailer with black bars, cut away by hand): squeezing fits exactly that part, cropping
+    /// frames inside it and the focus moves within it.
+    func testAreaLimitsBothFits() {
+        let size = CGSize(width: 3840, height: 2160)
+        let bars = CGRect(x: 0, y: 0.12, width: 1, height: 0.76)          // 2.35:1 picture inside 16:9
+        let squeeze = Reframe.plan(sourceSize: size, aspect: 1.42, mode: .squeeze, area: bars)
+        XCTAssertEqual(squeeze.cropRect, CGRect(x: 0, y: 259, width: 3840, height: 1642))
+        let left = Reframe.plan(sourceSize: size, aspect: 1.42, mode: .crop, focus: CGPoint(x: 0, y: 0.5), area: bars)
+        let right = Reframe.plan(sourceSize: size, aspect: 1.42, mode: .crop, focus: CGPoint(x: 1, y: 0.5), area: bars)
+        XCTAssertEqual(left.cropRect.minY, 259)
+        XCTAssertEqual(left.cropRect.height, 1642)
+        XCTAssertEqual(left.cropRect.minX, 0)
+        XCTAssertEqual(right.cropRect.maxX, 3840)
+        XCTAssertEqual(left.cropRect.width / left.cropRect.height, 1.42, accuracy: 0.002)
+        // the whole picture is the default and changes nothing
+        XCTAssertEqual(Reframe.plan(sourceSize: size, aspect: 1.42, mode: .crop),
+                       Reframe.plan(sourceSize: size, aspect: 1.42, mode: .crop, area: Reframe.wholePicture))
+    }
 }

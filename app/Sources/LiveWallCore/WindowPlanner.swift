@@ -84,7 +84,7 @@ public enum WindowPlanner {
 
     /// The frames at `times` as the checks see them: cropped like the wallpaper, `WindowAnalysis.reversalWidth` across.
     public static func windowFrames(source: FrameSource, times: [Double], crop: CGRect = fullFrame) async throws -> [RGB16Image] {
-        let frames = try await source.frames(at: times, width: decodeWidth(WindowAnalysis.reversalWidth, crop: crop))
+        let frames = try await source.frames(at: times, width: decodeWidth(WindowAnalysis.reversalWidth, crop: crop), fromProxy: false)
         return try frames.map { try cropped($0, to: crop, width: WindowAnalysis.reversalWidth) }
     }
 

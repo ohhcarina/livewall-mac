@@ -8,7 +8,8 @@ final class FrameSourceTests: XCTestCase {
     /// A short clip whose frames are blue with a red block in the stored top-left corner and a green strip down the
     /// stored right edge, so the stored orientation is unambiguous.
     private func writeClip(width: Int = 320, height: Int = 180, transform: CGAffineTransform = .identity,
-                           codec: AVVideoCodecType = .h264, colorProperties: [String: Any]? = nil) async throws -> URL {
+                           codec: AVVideoCodecType = .h264, colorProperties: [String: Any]? = nil,
+                           gray: CGFloat? = nil) async throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("lw-fs-\(UUID().uuidString).mov")
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -31,6 +32,13 @@ final class FrameSourceTests: XCTestCase {
                                 bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(),
                                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
             ctx.setFillColor(CGColor(red: 0, green: 0, blue: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            if let gray {                                   // one flat mid-tone, where the transfer curve shows
+                ctx.setFillColor(CGColor(red: gray, green: gray, blue: gray, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+                CVPixelBufferUnlockBaseAddress(buffer, [])
+                while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
+                XCTAssertTrue(adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(i), timescale: 24)))
+                continue
+            }
             ctx.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))                    // CG origin is bottom-left
             ctx.fill(CGRect(x: 0, y: height - height / 3, width: width / 4, height: height / 3))     // stored top-left
             ctx.setFillColor(CGColor(red: 0, green: 1, blue: 0, alpha: 1))
@@ -115,18 +123,39 @@ final class FrameSourceTests: XCTestCase {
         let hlg = try await FrameSource(url: try await writeClip(codec: .hevc, colorProperties: [
             AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
             AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020]))
-        guard case .unsupported = hlg.sourceColor else { return XCTFail("HLG must be refused, got \(hlg.sourceColor)") }
+        guard case .hdr = hlg.sourceColor else { return XCTFail("HLG must be read as HDR, got \(hlg.sourceColor)") }
+
+        // the decoder tone-maps it to SDR BT.709 and colours stay where they were
+        let sdrFrame = try await plain.frames(at: [0.2]).first!
+        let hlgFrame = try await hlg.frames(at: [0.2]).first!
+        for (fx, fy, want) in [(0.1, 0.1, Dominant.red), (0.97, 0.5, .green), (0.5, 0.7, .blue)] {
+            XCTAssertEqual(dominant(hlgFrame, fx, fy), want, "at \(fx),\(fy)")
+        }
+        let hlgProps: [String: Any] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                                       AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                                       AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020]
+        // The writer only tags these frames as HLG (it does not convert the code values), so a decode that skipped the
+        // tone mapping hands back exactly the SDR clip's values (11-17: 0.25/0.5/0.75 grey matched to the last bit).
+        // Tone-mapped they read as HLG and come out darker, still in order. Whether the brightness matches how the
+        // phone plays the video is a device question (#0007; recorded in docs/research-notes.md when tested).
+        var previous = 0.0
+        for g in [0.25, 0.5, 0.75] as [CGFloat] {
+            let sdrGray = try await FrameSource(url: try await writeClip(gray: g)).frames(at: [0.2]).first!
+            let hdrGray = try await FrameSource(url: try await writeClip(codec: .hevc, colorProperties: hlgProps, gray: g)).frames(at: [0.2]).first!
+            let i = (hdrGray.height / 2 * hdrGray.width + hdrGray.width / 2) * 4
+            let sdr = Double(sdrGray.pixels[i]) / 65535, mapped = Double(hdrGray.pixels[i]) / 65535
+            XCTAssertLessThan(mapped, sdr - 0.04, "grey \(g): not tone-mapped (SDR \(sdr), HLG \(mapped))")
+            XCTAssertGreaterThan(mapped, previous, "grey \(g) out of order")
+            previous = mapped
+        }
 
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("lw-out-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: out) }
         let recipe = WallpaperRecipe(sourceTimes: (0..<11).map { 0.05 + Double($0) * 0.04 }, aspect: 1.5)
-        do {
-            _ = try await WallpaperBuilder.build(source: hlg, recipe: recipe, name: "hlg", outputDirectory: out)
-            XCTFail("an HDR source must not be exported")
-        } catch {
-            XCTAssertTrue("\(error)".contains("HDR"), "\(error)")
-        }
+        // the builder checks the exported video carries the Display P3 tag
+        let result = try await WallpaperBuilder.build(source: hlg, recipe: recipe, name: "hlg", outputDirectory: out)
+        XCTAssertEqual(Double(result.videoSize.width) / Double(result.videoSize.height), 1.5, accuracy: 0.02)
     }
 }
 
