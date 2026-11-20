@@ -38,7 +38,7 @@ public enum AutoChoices {
 
     private static func fadeOutCover(_ src: FrameSource) async -> Double {
         let d = src.duration
-        guard let thumbs = try? await src.thumbnails(from: max(0, d - 30), to: d, fps: 4, width: 48), !thumbs.isEmpty else { return d }
+        guard let thumbs = try? await src.thumbnails(from: max(0, d - 30), to: d, fps: 4, width: 48, exact: false), !thumbs.isEmpty else { return d }
         let luma = thumbs.map { t -> (time: Double, value: Double) in
             let p = t.image.pixels
             var sum = 0.0

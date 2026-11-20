@@ -24,9 +24,8 @@ public final class FrameSource {
     public let url: URL
     public let asset: AVURLAsset
     let track: AVAssetTrack
-    /// A small copy of this video (`ProxyMaker`): small decodes come from it, full-size ones from the original. Only
-    /// used for requests at most half its width, where its compression is scaled away (11-18), and never for the
-    /// measurements the device rules were calibrated on (`frames(fromProxy: false)`).
+    /// A small, lower-frame-rate copy of this video (`ProxyMaker`) for the interface: dragging, playback, filmstrips.
+    /// Frames for planning and export never come from it (#0033: it skips frames, and the planner counts frames).
     public var proxy: FrameSource?
     /// Presentation duration of the video track in seconds.
     public let duration: Double
@@ -36,8 +35,21 @@ public final class FrameSource {
     public let size: CGSize
     /// Clockwise quarter turns that bring the stored frames upright (portrait phone videos are stored sideways).
     public let quarterTurns: Int
-    private let naturalSize: CGSize
+    let naturalSize: CGSize
     public let sourceColor: SourceColor
+    /// Recently decoded scaled frames (`selectiveFrames`): a plan reads the same frames near the cover several times.
+    let frameCache = FrameCache()
+    private let layoutLock = NSLock()
+    private var cachedLayout: StreamLayout?
+    /// Temporal layers and keyframe spacing (`SubsetDecoder`), read once on first use.
+    var layout: StreamLayout {
+        layoutLock.withLock {
+            if let cachedLayout { return cachedLayout }
+            let layout = readLayout()
+            cachedLayout = layout
+            return layout
+        }
+    }
 
     public init(url: URL) async throws {
         self.url = url
@@ -80,13 +92,8 @@ public final class FrameSource {
         return .unsupported("视频的色域是 \(primaries)（不是 BT.709 或 Display P3）")
     }
 
-    private func proxyFor(_ width: Int?) -> FrameSource? {
-        guard let proxy, let width, Double(width) * 2 <= Double(proxy.size.width) else { return nil }
-        return proxy
-    }
-
     /// Decoder output settings; `width` is the wanted width of the UPRIGHT frame (nil = full resolution).
-    private func decoderSettings(width: Int?) -> [String: Any] {
+    func decoderSettings(width: Int?) -> [String: Any] {
         var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBALE]
         if case .hdr = sourceColor {
             // asking for SDR BT.709 makes the decoder tone-map (VideoToolbox's HDR → SDR, as AVFoundation shows HDR
@@ -103,7 +110,7 @@ public final class FrameSource {
         return settings
     }
 
-    private func upright(_ buffer: CVPixelBuffer) throws -> RGB16Image {
+    func upright(_ buffer: CVPixelBuffer) throws -> RGB16Image {
         try RGB16Image(pixelBuffer: buffer).rotated(quarterTurns: quarterTurns)
     }
 
@@ -111,10 +118,15 @@ public final class FrameSource {
     /// frame). Results are in the order of `times`, decoded to 16-bit RGB with the source's own YCbCr matrix and no
     /// transfer-curve change (HDR sources: tone-mapped to SDR BT.709 first).
     /// `width`: let the decoder scale the frames to this width (previews); nil = full resolution.
-    /// `fromProxy: false` for measurements that decide what the phone does (`WindowPlanner.windowFrames`): fine texture
-    /// reads lower on the copy (11-18: steps up to 1.7 apart at 544 wide), and those numbers are calibrated on originals.
-    public func frames(at times: [Double], width: Int? = nil, fromProxy: Bool = true) async throws -> [RGB16Image] {
-        if fromProxy, let proxy = proxyFor(width) { return try await proxy.frames(at: times, width: width) }
+    public func frames(at times: [Double], width: Int? = nil) async throws -> [RGB16Image] {
+        // scaled looks only (the same pixels, `FrameSourceTests`): the export (full size) keeps reading the way it was
+        // device-tested
+        if let width, let frames = try selectiveFrames(at: times, width: width) { return frames }
+        return try await readerFrames(at: times, width: width)
+    }
+
+    /// `frames(at:)` decoding every frame from the first time to the last.
+    func readerFrames(at times: [Double], width: Int?) async throws -> [RGB16Image] {
         guard let lo = times.min(), let hi = times.max() else { return [] }
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: decoderSettings(width: width))
@@ -155,12 +167,45 @@ public final class FrameSource {
         return results.map { $0! }
     }
 
+    /// Most frames `thumbnails` asks `selectiveFrames` for at once (a plan's pool is up to 160: two batches).
+    static let selectiveBatch = 96
+
     /// Small frames sampled at `fps` between two times, in order — for planning and for thumbnails. The decoder scales
     /// them to `width` pixels wide; `transform` (e.g. a crop) runs on each as it is decoded, so only its result is kept.
-    public func thumbnails(from start: Double, to end: Double, fps: Double, width: Int,
+    /// `exact: false`: a sample may be any frame within about `1 / (2 fps)` s before its time, which lets the decoder
+    /// skip the frames in between where the stream allows it (`SubsetDecoder`) — for looks that do not count frames.
+    public func thumbnails(from start: Double, to end: Double, fps: Double, width: Int, exact: Bool = true,
                            transform: (RGB16Image) throws -> RGB16Image = { $0 }) async throws -> [(time: Double, image: RGB16Image)] {
-        if let proxy = proxyFor(width) {
-            return try await proxy.thumbnails(from: start, to: end, fps: fps, width: width, transform: transform)
+        // exact samples: only the frames they depend on, and none decoded again that a recent look already has
+        if exact, (end - start) * fps < 480 {
+            var times: [Double] = []
+            var t = start
+            while t <= end + 1e-9 { times.append(t); t += 1 / fps }
+            // in batches, made small as they come: a batch's frames are all held at the decode width until it is done
+            // (review 11-20: 400 at once, 615 wide for a portrait screen filled from a landscape video, was most of a
+            // gigabyte)
+            var out: [(time: Double, image: RGB16Image)] = []
+            for first in stride(from: 0, to: times.count, by: Self.selectiveBatch) {
+                let batch = Array(times[first..<min(times.count, first + Self.selectiveBatch)])
+                guard let frames = try selectiveFrames(at: batch, width: width) else { out = []; break }
+                out += try zip(batch, frames).map { ($0, try transform($1)) }
+            }
+            if out.count == times.count { return out }
+        }
+        if !exact, let subset = cheapSubset(forRate: 2 * fps) {
+            var out: [(Double, RGB16Image)] = []
+            var nextTime = start
+            var previous: CVPixelBuffer?
+            try decode(subset, from: start, to: end, width: width) { pts, pb in
+                while let prev = previous, nextTime < pts, nextTime <= end + 1e-9 {
+                    out.append((nextTime, try transform(try upright(prev))))
+                    nextTime += 1 / fps
+                }
+                previous = pb
+                return nextTime <= end + 1e-9
+            }
+            if let prev = previous, nextTime <= end + 1e-9 { out.append((nextTime, try transform(try upright(prev)))) }
+            return out
         }
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: decoderSettings(width: width))

@@ -1,13 +1,51 @@
 // A small copy of the source for editing (11-18, the user: 「先做 final cut pro 中那种代理……最后导出的时候再渲染」):
-// scrubbing, filmstrips, the lock-screen preview and the planner's small samples decode it instead of the 4K original;
-// the export and every full-size measurement still read the original (`FrameSource.proxy`).
+// dragging, playback and filmstrips use it instead of the 4K original. Planning, the lock-screen preview, the export and
+// the exact frame shown when paused all read the original.
 //
-// Same frames at the same presentation times (sample buffers are passed through with their timestamps), same rotation
-// and colour tags, so a frame number means the same picture in both. HDR is tone-mapped to SDR BT.709 on the way, the
-// same mapping `FrameSource` asks the decoder for, so the copy's frames match what the planner sees in the original.
+// At most `maxFrameRate` (#0033, 11-18): an 11-minute 240 fps aerial copied frame by frame took 320 s and 4.6 GB; a
+// stream with temporal layers gives its 30 fps frames without decoding the rest (layers 0–1 of 俯瞰伦敦: 14.8 s against
+// 139.7 s). Kept frames keep their presentation times, rotation and colour tags, so a time means the same picture in
+// both wherever the copy has that frame. HDR is tone-mapped to SDR BT.709 on the way, as `FrameSource` asks for.
 import AVFoundation
 import CoreMedia
 import Foundation
+import VideoToolbox
+
+/// Lets the editing copy wait while the person works (#0033, 11-19): the media engine decodes one stream at full speed,
+/// two at once each at half, so a drag or the first look at a new cover must not share it with the copy.
+public final class DecodeGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var held = false
+
+    public init() {}
+
+    /// While true, `pass` waits.
+    public var isHeld: Bool {
+        get { condition.lock(); defer { condition.unlock() }; return held }
+        set { condition.lock(); held = newValue; condition.broadcast(); condition.unlock() }
+    }
+
+    /// Returns once the gate is open (or `cancelled` says so). Blocks the calling thread: call it from the copy's own
+    /// decoding thread only, never from a Swift concurrency task (it would hold one of the pool's few threads).
+    func pass(cancelled: () -> Bool) {
+        condition.lock()
+        defer { condition.unlock() }
+        while held, !cancelled() { _ = condition.wait(until: Date(timeIntervalSinceNow: 0.1)) }
+    }
+}
+
+private struct Unchecked<Value>: @unchecked Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
+}
+
+/// A cancellation the copy's own thread can see (`Task.isCancelled` is false off a task).
+private final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set() { lock.lock(); value = true; lock.unlock() }
+}
 
 public enum ProxyMaker {
     /// Long side of the copy. Planner samples are at most a few hundred pixels wide; the video view rarely shows the
@@ -15,8 +53,10 @@ public enum ProxyMaker {
     public static let longSide = 1280
     /// A keyframe every this many frames: any frame decodes after at most this many others (scrubbing).
     public static let keyFrameInterval = 10
+    /// Frames per second the copy keeps at most (dragging shows nothing finer; the exact frame comes from the original).
+    public static let maxFrameRate = 30.0
     /// Bump when the copy's recipe changes (size, keyframes, quality, colour handling): cached copies are keyed on it.
-    public static let version = 1
+    public static let version = 3
 
     /// Whether decoding the original is slow enough to be worth a copy: larger than 1080p, or a codec without a cheap
     /// hardware path everywhere (AV1, VP9, ProRes ...).
@@ -32,7 +72,9 @@ public enum ProxyMaker {
     }
 
     /// Writes the copy to `url` (replaced if it exists). `progress` gets 0...1 as frames are written.
-    public static func make(from source: FrameSource, to url: URL, progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws {
+    /// `gate`: waits there between frames while it is held.
+    public static func make(from source: FrameSource, to url: URL, gate: DecodeGate? = nil,
+                            progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws {
         try? FileManager.default.removeItem(at: url)
         let track = source.track
         let natural = try await track.load(.naturalSize)
@@ -76,8 +118,10 @@ public enum ProxyMaker {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var writeSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: w, AVVideoHeightKey: h,
-            AVVideoCompressionPropertiesKey: [AVVideoQualityKey: 0.8, AVVideoMaxKeyFrameIntervalKey: keyFrameInterval,
-                                              AVVideoAllowFrameReorderingKey: false] as [String: Any],
+            AVVideoCompressionPropertiesKey: [AVVideoQualityKey: 0.6, AVVideoMaxKeyFrameIntervalKey: keyFrameInterval,
+                                              AVVideoAllowFrameReorderingKey: false,
+                                              // #0033: an 11-minute aerial's copy was encoder-bound (90 of 120 s)
+                                              kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String: true] as [String: Any],
         ]
         if let colour { writeSettings[AVVideoColorPropertiesKey] = colour }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: writeSettings)
@@ -86,19 +130,74 @@ public enum ProxyMaker {
         guard writer.canAdd(input) else { throw EngineError.unsupported("cannot write the editing copy") }
         writer.add(input)
 
-        guard reader.startReading() else { throw EngineError.io("reader failed: \(reader.error?.localizedDescription ?? "?")") }
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
+        // a stream with temporal layers: decode only those up to `maxFrameRate` (SDR only, see `SubsetDecoder`)
+        let layers = source.cheapSubset(forRate: maxFrameRate * 0.99).flatMap { if case .temporalLayers = $0 { $0 } else { nil } }
+        if layers == nil, !reader.startReading() { throw EngineError.io("reader failed: \(reader.error?.localizedDescription ?? "?")") }
         guard writer.startWriting() else { throw EngineError.io("writer failed: \(writer.error?.localizedDescription ?? "?")") }
         writer.startSession(atSourceTime: .zero)
         var reported = -1.0
+        var lastKept = -Double.infinity
+        // a frame closer than this to the last one kept is dropped (24–30 fps sources keep every frame)
+        let gap = 1 / maxFrameRate - 0.5 / max(1, source.frameRate)
+        func report(_ pts: Double) {
+            let done = min(1, pts / max(0.001, source.duration))
+            if done - reported >= 0.01 { reported = done; progress(done) }        // whole percents, not every frame
+        }
         do {
-            while let sample = output.copyNextSampleBuffer() {
-                try Task.checkCancellation()
-                while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(2)) }
-                guard input.append(sample) else {
-                    throw EngineError.io("writing the editing copy failed: \(writer.error?.localizedDescription ?? "?")")
+            if let layers {
+                // minutes of synchronous decoding with blocking waits: on a thread of its own, not the task's pool
+                // thread (review 11-20)
+                let flag = CancelFlag()
+                // handed to that one thread and used only there until it is done
+                let parts = Unchecked((source: source, input: input, adaptor: adaptor, writer: writer))
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, Error>) in
+                        let thread = Thread {
+                            let (source, input, adaptor, writer) = parts.value
+                            do {
+                                try source.decode(layers, from: 0, to: source.duration, width: nil,
+                                                  pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, storedSize: (w, h)) { pts, buffer in
+                                    gate?.pass(cancelled: { flag.isSet })
+                                    if flag.isSet { throw CancellationError() }
+                                    // a writer that failed (disk full) never gets ready again: stop rather than spin (review)
+                                    while !input.isReadyForMoreMediaData {
+                                        if flag.isSet { throw CancellationError() }
+                                        if writer.status == .failed {
+                                            throw EngineError.io("writing the editing copy failed: \(writer.error?.localizedDescription ?? "?")")
+                                        }
+                                        usleep(2000)
+                                    }
+                                    guard adaptor.append(buffer, withPresentationTime: CMTime(seconds: pts, preferredTimescale: 600_000)) else {
+                                        throw EngineError.io("writing the editing copy failed: \(writer.error?.localizedDescription ?? "?")")
+                                    }
+                                    report(pts)
+                                    return true
+                                }
+                                done.resume()
+                            } catch {
+                                done.resume(throwing: error)
+                            }
+                        }
+                        thread.qualityOfService = .userInitiated     // as the task it stands in for (review)
+                        thread.start()
+                    }
+                } onCancel: {
+                    flag.set()
                 }
-                let done = min(1, CMSampleBufferGetPresentationTimeStamp(sample).seconds / max(0.001, source.duration))
-                if done - reported >= 0.01 { reported = done; progress(done) }        // whole percents, not every frame
+            } else {
+                while let sample = output.copyNextSampleBuffer() {
+                    while gate?.isHeld == true, !Task.isCancelled { try await Task.sleep(for: .milliseconds(100)) }
+                    try Task.checkCancellation()
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                    if pts - lastKept < gap { continue }
+                    lastKept = pts
+                    while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(2)) }
+                    guard input.append(sample) else {
+                        throw EngineError.io("writing the editing copy failed: \(writer.error?.localizedDescription ?? "?")")
+                    }
+                    report(pts)
+                }
             }
         } catch {
             reader.cancelReading()
@@ -106,7 +205,7 @@ public enum ProxyMaker {
             try? FileManager.default.removeItem(at: url)
             throw error
         }
-        guard reader.status == .completed else {
+        guard layers != nil || reader.status == .completed else {
             writer.cancelWriting()
             try? FileManager.default.removeItem(at: url)
             throw EngineError.io("reading the original failed: \(reader.error?.localizedDescription ?? "?")")

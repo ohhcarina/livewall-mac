@@ -32,6 +32,53 @@ final class TailBlendTests: XCTestCase {
         XCTAssertEqual(TailBlend.alphas(window: window), [Double](repeating: 0, count: 11))
     }
 
+    /// grey 40 with one block (1/64 of the frame) at `patch`: the whole-frame mean barely moves, the block does.
+    private func patched(_ patch: Double) -> RGB16Image {
+        var img = grey(40, width: 64, height: 64)
+        let q = UInt16(patch * 257)
+        for y in 0..<8 { for x in 0..<8 { let p = (y * 64 + x) * 4; img.pixels[p] = q; img.pixels[p + 1] = q; img.pixels[p + 2] = q } }
+        return img
+    }
+
+    func testLocalDiffSeesWhatTheMeanDilutes() {
+        let a = patched(40), b = patched(200)
+        XCTAssertEqual(a.meanAbsDiff(b), 160.0 / 64, accuracy: 0.01)
+        XCTAssertEqual(a.localMaxDiff(b), 160, accuracy: 0.5, "one 8x8-grid cell changed by 160")
+    }
+
+    /// 11-18 GTA logo (rounds 46-48): the words popped in over the last 3 frames on a still background. The mean said
+    /// the tail was close (8, 3.5), one region was still 135 away and motion did not turn on; mixed until that region
+    /// sat at most `localTailCap` away, it did.
+    func testLocalPopInIsMixedUntilTheRegionIsClose() throws {
+        var window = [40, 40, 40, 40, 40, 40, 40, 40, 100, 160, 200].map { patched(Double($0)) }
+        XCTAssertLessThan(window[9].meanAbsDiff(window[10]), WindowAnalysis.lastStepComfortable, "the mean misses it")
+        let alphas = TailBlend.alphas(window: window, localAllowed: TailBlend.localTailCap)
+        XCTAssertEqual(alphas.first, 0)
+        XCTAssertEqual(alphas.last, 0)
+        try TailBlend.apply(&window, alphas: alphas)
+        let cover = window[10]
+        for (k, cap) in TailBlend.localTailCap.enumerated() {
+            XCTAssertLessThanOrEqual(window[9 - k].localMaxDiff(cover), cap + 0.5)
+        }
+    }
+
+    /// 11-18 R51: the frame two before the cover needed more mixing (0.68) than the one right before it (0.32), so the
+    /// words went sharp, soft again, then sharp on the cover (「末尾auto底部发虚又恢复了」). Closer to the cover never
+    /// mixes less.
+    func testLocalMixNeverDropsTowardTheCover() throws {
+        // the region pops in two frames before the cover, then barely moves
+        let window = [40, 40, 40, 40, 40, 40, 40, 40, 190, 196, 200].map { patched(Double($0)) }
+        let alphas = TailBlend.alphas(window: window, localAllowed: TailBlend.localTailCap)
+        let mixed = alphas.dropFirst().dropLast()
+        for (a, b) in zip(mixed, mixed.dropFirst()) { XCTAssertLessThanOrEqual(a, b + 1e-9, "\(alphas)") }
+        XCTAssertGreaterThan(alphas[9], 0, "the frame before the cover follows the one before it: \(alphas)")
+    }
+
+    func testCloseTailIsNotMixedLocally() {
+        let window = (0...10).map { patched(40 + 1.5 * Double($0)) }
+        XCTAssertEqual(TailBlend.alphas(window: window, localAllowed: TailBlend.localTailCap), [Double](repeating: 0, count: 11))
+    }
+
     func testApplyMixesTowardTheCover() throws {
         var frames = [grey(0), grey(100), grey(200)]
         try TailBlend.apply(&frames, alphas: [0, 0.5, 0])

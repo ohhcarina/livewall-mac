@@ -172,3 +172,72 @@ final class RotationTests: XCTestCase {
         XCTAssertEqual(red(img.rotated(quarterTurns: -1)), red(img.rotated(quarterTurns: 3)))
     }
 }
+
+/// #0033: decoding only what the wanted frames depend on must give the same pixels as decoding everything.
+final class SelectiveDecodeTests: XCTestCase {
+    /// `count` frames at `fps`, frame i a different picture (a bar that moves and a grey that steps), keyframes every
+    /// `keyInterval` frames; HEVC with frame reordering, so decode and presentation order differ.
+    private func writeMovingClip(count: Int = 90, fps: Int32 = 30, keyInterval: Int = 30, codec: AVVideoCodecType = .hevc) async throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("lw-sel-\(UUID().uuidString).mov")
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        let width = 320, height = 180
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: codec, AVVideoWidthKey: width, AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [AVVideoMaxKeyFrameIntervalKey: keyInterval, AVVideoAllowFrameReorderingKey: true]])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height])
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        for i in 0..<count {
+            var pb: CVPixelBuffer?
+            CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &pb)
+            let buffer = try XCTUnwrap(pb)
+            CVPixelBufferLockBaseAddress(buffer, [])
+            let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height, bitsPerComponent: 8,
+                                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+            let g = CGFloat(i % 30) / 40 + 0.1
+            ctx.setFillColor(CGColor(red: g, green: 0.3, blue: 1 - g, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(CGRect(x: (i * 3) % (width - 20), y: 40, width: 20, height: 100))
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertTrue(adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(i), timescale: fps)))
+        }
+        input.markAsFinished()
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed, "\(String(describing: writer.error))")
+        return url
+    }
+
+    private func assertSame(_ a: [RGB16Image], _ b: [RGB16Image], file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(a.count, b.count, file: file, line: line)
+        for (i, (x, y)) in zip(a, b).enumerated() {
+            XCTAssertEqual(x.width, y.width, file: file, line: line)
+            XCTAssertTrue(x.pixels == y.pixels, "frame \(i) differs", file: file, line: line)
+        }
+    }
+
+    func testSelectiveFramesMatchDecodingEverything() async throws {
+        for codec in [AVVideoCodecType.hevc, .h264] {
+            let source = try await FrameSource(url: try await writeMovingClip(codec: codec))
+            // far apart (other keyframe groups), next to each other, repeated, out of order, past the end
+            let times = [2.95, 0.05, 1.51, 1.55, 1.55, 0.99, 1.02, 2.0, 5.0]
+            let selective = try XCTUnwrap(try source.selectiveFrames(at: times, width: 160))
+            let reader = try await source.readerFrames(at: times, width: 160)
+            assertSame(selective, reader)
+            // a second look comes from the cache, still the same
+            assertSame(try XCTUnwrap(try source.selectiveFrames(at: times, width: 160)), reader)
+        }
+    }
+
+    func testThinnedThumbnailsMatchDecodingEverything() async throws {
+        let source = try await FrameSource(url: try await writeMovingClip())
+        let thinned = try await source.thumbnails(from: 0.4, to: 2.9, fps: 7, width: 96)
+        let reader = try await source.readerFrames(at: thinned.map(\.time), width: 96)
+        assertSame(thinned.map(\.image), reader)
+    }
+}

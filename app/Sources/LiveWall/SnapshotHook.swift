@@ -48,12 +48,79 @@ enum SnapshotHook {
                 }
             }
         }
+        // `LIVEWALL_DRAG=4` drags the cover on the lock screen that many times, each once the picture for the last one is
+        // up (the calls the trim bar makes, 240 pointer moves in 4 s, back and forth), and says on stderr how each went:
+        // how long the moves took (over 4 s: the main thread could not keep up) and how many pictures reached the
+        // preview, and when the picture, the editing copy, the settled automatic start and the whole start search arrived. 11-19: a build nobody had
+        // dragged in showed no picture from the second drag on.
+        if let rounds = ProcessInfo.processInfo.environment["LIVEWALL_DRAG"].flatMap({ Int($0) }) {
+            let launch = Date()
+            func say(_ text: String) {
+                FileHandle.standardError.write(Data(String(format: "[%6.1f s] %@\n", Date().timeIntervalSince(launch), text).utf8))
+            }
+            // what arrives when, all along
+            Task { @MainActor in
+                var picture = false, copy = false, complete = false, planning = false, settling = false
+                var lastFailure: String?
+                while true {
+                    let p = !project.answersAreStale && project.planIsCurrent, c = project.exactPlayer != nil
+                    let s = project.searchIsComplete
+                    if p != picture { picture = p; if p { say(String(format: "picture up (start %.2f s before the cover)", project.span)) } }
+                    if project.phase == .planning, !planning { planning = true } else if project.phase != .planning { planning = false }
+                    if c != copy { copy = c; if c { say("editing copy in use") } }
+                    if project.startIsSettling != settling {
+                        settling = project.startIsSettling
+                        say(settling ? "start settling" : String(format: "start settled (%.2f s before the cover, colour bar %@)",
+                                                                  project.span, project.feelBands == nil ? "missing" : "in"))
+                    }
+                    if let failed = project.planFailed, failed != lastFailure { lastFailure = failed; say("plan failed: \(failed)") }
+                    if s != complete { complete = s; if s { say(String(format: "start search complete (smoothest %.2f s before the cover)", project.rangeEnd - (project.smoothStart ?? project.rangeEnd))) } }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+            }
+            for round in 0..<rounds {
+                for _ in 0..<1200 where project.source == nil || !project.planIsCurrent || project.answersAreStale {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                try? await Task.sleep(for: .seconds(2))
+                let began = Date(), span = project.span, onCopy = project.exactPlayer != nil
+                var pictures = 0, last = project.scrubFrame
+                // `LIVEWALL_DRAG_WHAT=start`: the start handle instead, out to 3, 9, 3, 9 ... s before the cover
+                let start = ProcessInfo.processInfo.environment["LIVEWALL_DRAG_WHAT"] == "start"
+                let from = project.rangeStart, to = max(0, project.rangeEnd - (round % 2 == 0 ? 3 : 9))
+                project.pause()
+                project.beginEdit()
+                if start { project.startIsAuto = false }
+                for k in 0..<240 {
+                    if start {
+                        project.rangeStart = from + (to - from) * Double(k + 1) / 240
+                        project.scrub(at: project.rangeStart)
+                    } else {
+                        project.moveCover(to: project.rangeEnd + (round % 2 == 0 ? -0.05 : 0.03), keeping: span)
+                        project.scrub(at: project.rangeEnd)
+                    }
+                    try? await Task.sleep(for: .milliseconds(16))
+                    if project.scrubFrame !== last { pictures += 1; last = project.scrubFrame }
+                }
+                say(String(format: "drag %d (%@) on the %@: 240 moves in %.1f s, %d pictures", round + 1, start ? "start" : "cover",
+                           onCopy ? "copy" : "original", Date().timeIntervalSince(began), pictures))
+                // held still a moment before letting go, as people do (`LIVEWALL_DRAG_REST` ms, default 0)
+                if let rest = ProcessInfo.processInfo.environment["LIVEWALL_DRAG_REST"].flatMap({ Int($0) }) {
+                    try? await Task.sleep(for: .milliseconds(rest))
+                }
+                project.endScrub(keepPicture: !start)
+                project.endEdit(start ? "调整起点" : "调整封面")
+            }
+        }
         let exportDir = ProcessInfo.processInfo.environment["LIVEWALL_EXPORT"]
         guard outputPath != nil || exportDir != nil else { return }
         for _ in 0..<240 {                                   // up to 60 s for the source to load and the preview to build
             try? await Task.sleep(nanoseconds: 250_000_000)
             if project.phase == .ready, !project.frames.isEmpty { break }
         }
+        // the whole start search, so a scripted export always gets the final automatic start (#0033: the first picture
+        // comes with the start the nearest 2 s allow)
+        for _ in 0..<480 where !project.searchIsComplete { try? await Task.sleep(nanoseconds: 250_000_000) }
         if let dir = exportDir {                             // also run the export, to check the whole flow
             let name = ProcessInfo.processInfo.environment["LIVEWALL_EXPORT_NAME"] ?? "app-export"
             if dir == "temp" { project.exportToTemporaryFolder() }      // the app's own flow: render first, pick a place after

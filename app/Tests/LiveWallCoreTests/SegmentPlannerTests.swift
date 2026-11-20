@@ -17,6 +17,35 @@ final class SegmentPlannerTests: XCTestCase {
         return try await FrameSource(url: url)
     }
 
+    /// 11-18 GTA logo (rounds 46-48): a still background, and one region (1/64 of the frame) pops in over the last 3
+    /// frames. No frame in time is closer, so the plan mixes the tail until that region is close to the cover.
+    func testLocalPopInAtTheEndIsMixed() async throws {
+        let w = 160, h = 96
+        let frames: [RGB16Image] = (0..<60).map { i in
+            var img = RGB16Image(width: w, height: h)
+            let levels: [Int: Double] = [56: 100, 57: 160, 58: 200, 59: 200]
+            let level: Double = levels[i] ?? 40
+            for y in 0..<h { for x in 0..<w {
+                let value: Double = x < 20 && y < 12 ? level : 40
+                let v = UInt16(value * 257), p = (y * w + x) * 4
+                img.pixels[p] = v; img.pixels[p + 1] = v; img.pixels[p + 2] = v
+            } }
+            return img
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("lw-seg-\(UUID().uuidString).mov")
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        try await HEVCWriter.write(frames: frames, settings: .init(width: w, height: h, fps: 30), to: url)
+        let source = try await FrameSource(url: url)
+        let plan = try await SegmentPlanner.plan(source: source, start: 1, cover: source.duration - 0.02)
+        XCTAssertGreaterThan(plan.blend.max() ?? 0, 0, "the words are mixed in")
+        XCTAssertEqual(plan.blend.first, 0)
+        var window = try await WindowPlanner.windowFrames(source: source, times: plan.times)
+        try TailBlend.apply(&window, alphas: plan.blend)
+        for (k, cap) in TailBlend.localTailCap.enumerated() {
+            XCTAssertLessThanOrEqual(window[9 - k].localMaxDiff(window[10]), cap + 2)
+        }
+    }
+
     func testFeelThresholds() {
         XCTAssertEqual(SegmentPlanner.feel(maxStep: 11), .smooth)
         XCTAssertEqual(SegmentPlanner.feel(maxStep: 15), .jumpy)
@@ -49,7 +78,32 @@ final class SegmentPlannerTests: XCTestCase {
         XCTAssertEqual(plan.feel, .smooth)
     }
 
-    /// The cover at the clip's very end (what the App picks by default) must still give 11 different frames.
+    /// A short flash 1 s before the cover: starts whose frames land on it are rough, longer ones step over it and are
+    /// smooth again (11-18 GTA logo). The bands must show that, not paint everything past the first rough start.
+    func testFeelBandsAreNotMonotonic() async throws {
+        let source = try await clip(frames: 150) { i in (118...120).contains(i) ? 200 : 100 + 0.1 * Double(i) }
+        let cover = source.duration - 0.02
+        let bands = try await SegmentPlanner.feelBands(source: source, cover: cover)
+        XCTAssertEqual(bands.first?.to ?? 0, cover, accuracy: 1e-9)
+        XCTAssertEqual(bands.last?.from, 0)
+        for (a, b) in zip(bands, bands.dropFirst()) {
+            XCTAssertEqual(a.from, b.to, accuracy: 1e-9)
+            XCTAssertNotEqual(a.feel, b.feel)
+        }
+        let firstRough = try XCTUnwrap(bands.firstIndex { $0.feel != .smooth }, "\(bands)")
+        XCTAssertTrue(bands[(firstRough + 1)...].contains { $0.feel == .smooth }, "smooth again past the flash: \(bands)")
+        let smooth = try await SegmentPlanner.smoothestStart(source: source, cover: cover)
+        XCTAssertGreaterThanOrEqual(smooth, bands[firstRough].to - 0.05, "the smoothest start stays before the flash")
+    }
+
+    /// A cover within the first 10 frames (11-18 review): nothing to sweep, the whole bar is smooth, never left empty
+    /// (an empty answer is never asked again and the bar stayed grey).
+    func testFeelBandsNearTheStartAreOneSmoothBand() async throws {
+        let source = try await clip(frames: 60) { 60 + 0.5 * Double($0) }
+        let bands = try await SegmentPlanner.feelBands(source: source, cover: 10 / 30.0)
+        XCTAssertEqual(bands, [SegmentPlanner.FeelBand(from: 0, to: 10 / 30.0, feel: .smooth)])
+    }
+
     func testFrameTimesPickElevenDifferentFrames() {
         let times = SegmentPlanner.frameTimes(start: 24.125 - 10 / 24.0, cover: 24.125, frameRate: 24, duration: 24.125)
         let indices = times.map { Int($0 * 24) }
@@ -60,42 +114,33 @@ final class SegmentPlannerTests: XCTestCase {
         XCTAssertEqual(Set(wide).count, 11)
     }
 
-    /// A clip whose last frames repeat (R5-1, 11-11: three identical frames at the end and motion did not turn on):
-    /// the cover moves to the first frame of the repeat, so the last step is a real one.
-    func testRepeatedLastFramesAreNotTheTail() async throws {
+    /// The cover is the frame the person picked, also when the last frames repeat (11-18 「用户有可能会想要最后不动……
+    /// 不要直接做」; identical last frames turned motion on in R6-3, R7-1 and R46-3).
+    func testRepeatedLastFramesKeepTheCover() async throws {
         let source = try await clip(frames: 60) { 60 + 2 * Double(min($0, 57)) }
-        let plan = try await SegmentPlanner.plan(source: source, start: source.duration - 10 / 30.0, cover: source.duration)
-        XCTAssertEqual(Int(plan.times.last! * 30), 57)
-        XCTAssertGreaterThan(plan.report.stepDiffs.suffix(2).min()!, SegmentPlanner.sameFrame)
+        let cover = source.duration - 0.5 / 30
+        let plan = try await SegmentPlanner.plan(source: source, start: source.duration - 10 / 30.0, cover: cover)
+        XCTAssertEqual(plan.times.last!, cover, accuracy: 0.5 / 30)
+        XCTAssertEqual(plan.times.count, 11)
     }
 
-    /// A freeze at the end of a longer stretch (11-18, GTA at 1:17.7): the cover becomes the freeze's first frame, but
-    /// the start stays where it was chosen, so everything played is inside the chosen stretch.
-    func testFrozenEndKeepsTheStart() async throws {
+    /// A freeze at the end of a longer stretch (11-18, GTA at 1:17.7): cover and start both stay where they were
+    /// chosen; the motion plays, then rests on the still picture.
+    func testFrozenEndKeepsCoverAndStart() async throws {
         let source = try await clip(frames: 90) { 60 + 2 * Double(min($0, 70)) }       // still from frame 70 on
         let start = 40.5 / 30, cover = 85.5 / 30
         let plan = try await SegmentPlanner.plan(source: source, start: start, cover: cover)
-        XCTAssertEqual(Int(plan.times.last! * 30), 70)
+        XCTAssertEqual(plan.times.last!, cover, accuracy: 0.5 / 30, "the cover the person chose")
         XCTAssertEqual(plan.times.first!, start, accuracy: 0.5 / 30, "the start the person chose")
+        XCTAssertLessThan(plan.times[5], 70 / 30.0, "the motion is still in the frames that play")
     }
 
-    /// A slow reveal (11-18, a logo whose background faded in over 3 s): each frame differs from the next by less than
-    /// `sameFrame`, but they add up. The cover the person picked stays where it is; only true repeats move it.
+    /// A slow reveal (11-18, a logo whose background faded in over 3 s): the cover the person picked stays where it is.
     func testSlowRevealKeepsTheCover() async throws {
-        // a bright band widens by 1 column every frame: 100 / 160 = 0.6 per frame, well under `sameFrame`
         let source = try await reveal(frames: 120, framesPerColumn: 1)
         let cover = 110.5 / 30
         let plan = try await SegmentPlanner.plan(source: source, start: cover - 1, cover: cover)
-        XCTAssertEqual(plan.times.last!, cover, accuracy: 8 / 30, "walked back \((cover - plan.times.last!) * 30) frames")
-    }
-
-    /// Slower still (11-18 review): each pass walks most of the frames it looks at; later passes must keep comparing
-    /// with the picked cover, not re-anchor on where the last pass stopped and chain on.
-    func testVerySlowRevealDoesNotChainAcrossPasses() async throws {
-        let source = try await reveal(frames: 300, framesPerColumn: 5)
-        let cover = 290.5 / 30
-        let plan = try await SegmentPlanner.plan(source: source, start: cover - 1, cover: cover)
-        XCTAssertEqual(plan.times.last!, cover, accuracy: 10 / 30, "walked back \((cover - plan.times.last!) * 30) frames")
+        XCTAssertEqual(plan.times.last!, cover, accuracy: 0.5 / 30)
     }
 
     /// A bright band over grey that widens by one column every `framesPerColumn` frames, 160x90, 30 fps.
@@ -139,12 +184,12 @@ final class SegmentPlannerTests: XCTestCase {
         XCTAssertEqual(picks, picks.sorted())
     }
 
-    /// A clip that ends on a still longer than the frames looked at one by one (11-12 review: 24): the cover still
-    /// moves to the first frame of the still.
+    /// A clip that ends on a long still, cover at the very end: the cover stays there, the motion plays before it.
     func testLongFreezeAtTheEnd() async throws {
         let source = try await clip(frames: 120) { 40 + 1.5 * Double(min($0, 79)) }
         let plan = try await SegmentPlanner.plan(source: source, start: 1, cover: source.duration)
-        XCTAssertEqual(Int(plan.times.last! * 30), 79)
+        XCTAssertEqual(Int(plan.times.last! * 30), 119)
+        XCTAssertLessThan(plan.times.first!, 79 / 30.0)
     }
 
     func testCalmClipReachesTheBeginning() async throws {

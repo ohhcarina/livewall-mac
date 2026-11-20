@@ -40,7 +40,7 @@ usage:
   livewall-cli encode <frames dir with f00.png...> <out.mov>   (P3 PNGs -> HEVC, for pipeline tests)
   livewall-cli plan <video> --start S --end E          (prints the 11 times of a decreasing-step window)
   livewall-cli check <video> --times t1,...,t11 [--width W]   (the window checks; W = decode width, default full)
-  livewall-cli build <video> (--times t1,...,tN | --range S,E [--path now|even|even-blend|app|app-smooth] [--blend] [--last-step X]) --aspect A --name NAME --out DIR [--mode squeeze|crop] [--focus X,Y] [--area X,Y,W,H] [--quality Q] [--video-zoom Z] [--max-long-side N] [--cover-quality Q]
+  livewall-cli build <video> (--times t1,...,tN | --range S,E [--path now|even|even-blend|app|app-smooth] [--bands] [--blend] [--last-step X]) --aspect A --name NAME --out DIR [--mode squeeze|crop] [--focus X,Y] [--area X,Y,W,H] [--quality Q] [--video-zoom Z] [--max-long-side N] [--cover-quality Q]
       --path (with --range; experiments for #0017, default now): now = the App's planner (decreasing steps, calm end);
       even = 11 frames spread evenly over the range; even-blend = even, last frames mixed toward the cover so the
       last step is about --last-step (default 3); --blend mixes the same way on any path
@@ -56,7 +56,7 @@ usage:
 
 let raw = Array(CommandLine.arguments.dropFirst())
 guard let command = raw.first else { fail(usage) }
-let args = Args(Array(raw.dropFirst()), flagNames: ["p3", "blend", "app-blend"])
+let args = Args(Array(raw.dropFirst()), flagNames: ["p3", "blend", "app-blend", "bands"])
 
 func parseSize(_ s: String) -> (Int, Int) {
     let parts = s.split(separator: "x").compactMap { Int($0) }
@@ -215,7 +215,15 @@ do {
                 let plan = try await SegmentPlanner.plan(source: source, start: start, cover: v[1], crop: crop)
                 recipe.sourceTimes = plan.times
                 recipe.coverBlend = plan.blend
-                print("  feel \(plan.feel)  max step \(String(format: "%.1f", plan.maxStep))")
+                print("  feel \(plan.feel)  max step \(String(format: "%.1f", plan.maxStep))"
+                      + (plan.blend.contains { $0 > 0 } ? "  blend " + plan.blend.map { String(format: "%.2f", $0) }.joined(separator: " ") : ""))
+                print("  times " + plan.times.map { String(format: "%.4f", $0) }.joined(separator: " "))
+                if args.flags.contains("bands") {
+                    // the App's colour bar under the start row, as seconds before the cover
+                    for b in try await SegmentPlanner.feelBands(source: source, cover: v[1], crop: crop) {
+                        print(String(format: "  bar %6.2f - %6.2f s back  ", v[1] - b.to, v[1] - b.from) + "\(b.feel)")
+                    }
+                }
             default:
                 fail("--path now|even|even-blend|app|app-smooth")
             }

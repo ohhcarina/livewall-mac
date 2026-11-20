@@ -36,12 +36,12 @@ struct TrimBar: View {
     @State private var lastX: CGFloat = 0
     @State private var coverRowWidth: CGFloat = 1
     private let pointsPerFrame: CGFloat = 8
-    /// The start row's window, held still while the start is dragged: the scale must not change under the pointer.
+    /// The start row's window while the start is dragged: held still (the scale must not change under the pointer),
+    /// widened when the pointer pushes past its left end, zoomed in on a hold (`startZoomed`).
     @State private var frozenWindow: ClosedRange<Double>?
-    /// While the cover is dragged: how many seconds the start row shows, held so the row slides with the cover and keeps
-    /// its scale (11-18: it used to squeeze as the cover moved, measured from the old plan's starts —
-    /// 「底下不管怎么样都应该是固定的」).
-    @State private var coverDragWidth: Double?
+    /// Holding the start still zoomed the start row in on it, `pointsPerFrame` per source frame (like the cover row).
+    @State private var startZoomed = false
+    @State private var startRowWidth: CGFloat = 1
     /// The cover is dragged, or its plan has not answered yet (or failed): what the start row has of the last plan
     /// belongs to another cover. `Project.answeredCover` knows; no guessing here (11-18 review).
     private var coverIsMoving: Bool { dragging == .cover || project.answersAreStale }
@@ -61,8 +61,17 @@ struct TrimBar: View {
                 // lined up with the start row's pictures (its handle sits left of them)
                 coverRow.frame(height: coverHeight).padding(.leading, handleWidth).padding(.trailing, 3)
                 title("选起点") {
-                    Text(String(format: "封面前 %.1f 秒 · %.1f× 快放", project.span, project.speedUp)).monospacedDigit()
-                        .help("锁屏只用约 0.75 秒播这一整段，所以是快放")
+                    if project.startIsSettling {
+                        // the automatic start may still move (once): say so instead of a number that is about to change
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                            Text("正在找最顺的起点…")
+                        }
+                        .help("先按封面前 2 秒给出了画面；量完封面前 20 秒后，起点可能再往前挪一次，颜色条同时出现")
+                    } else {
+                        Text(String(format: "封面前 %.1f 秒 · %.1f× 快放", project.span, project.speedUp)).monospacedDigit()
+                            .help("锁屏只用约 0.75 秒播这一整段，所以是快放")
+                    }
                 }
                 .padding(.top, 6)
                 startRow.frame(height: tickArea + startHeight + zoneGap + zoneHeight)
@@ -80,14 +89,9 @@ struct TrimBar: View {
             let images = await PreviewImages.filmstrip(of: asset, from: window.lowerBound, to: window.upperBound, count: 12)
             if !Task.isCancelled, !images.isEmpty { withAnimation(.easeOut(duration: 0.2)) { fineStrip = (window, images) } }
         }
-        .onChange(of: coverIsMoving) {
-            // the new cover's answers are in: the start row may take its own width again, in one move
-            guard !coverIsMoving, coverDragWidth != nil else { return }
-            withAnimation(.easeOut(duration: 0.3)) { coverDragWidth = nil }
-        }
         .onChange(of: project.sourceURL) {
             holdTimer?.cancel(); holdTimer = nil
-            fine = nil; fineStrip = nil; dragging = nil; frozenWindow = nil; coverDragWidth = nil
+            fine = nil; fineStrip = nil; dragging = nil; frozenWindow = nil; startZoomed = false
         }
     }
 
@@ -249,23 +253,22 @@ struct TrimBar: View {
 
     // MARK: row 2, the start
 
-    /// The seconds before the cover the start row shows: enough to see where it turns jumpy, and the chosen start with
-    /// room to drag further (the window grows again after each drag).
+    /// The seconds before the cover the start row shows. It changes only with what the person does (11-20, the user:
+    /// 「范围在很多情况下会自己变，让人有不确定感，这块你参考下成熟做法吧」; 11-18 「底下不管怎么样都应该是固定的」): like the
+    /// trim bar in Photos, one scale that slides with the cover, zoomed in while the handle is held, widened when the start
+    /// is pushed past its left end. It used to follow how far back the footage stayed smooth, so it changed as the
+    /// search went on and after each drag.
     private var zoomWindow: ClosedRange<Double> {
         let cover = project.rangeEnd
-        if let held = coverDragWidth {
-            let lo = max(0, cover - held)
-            return lo...max(cover, lo + 0.001)
-        }
         let lo = max(0, cover - zoomWidth)
         return lo...max(cover, lo + 0.001)
     }
 
-    /// How many seconds the start row wants to show, before it is cut at 0:00.
+    /// How many seconds the start row shows, before it is cut at 0:00: what the automatic start may use
+    /// (`SegmentPlanner.startReach`), or as far as the start if that is farther (pushed past the left end, keys, undo).
+    /// So it narrows again when the start comes back (11-20 「放大了之后没办法缩小了」).
     private var zoomWidth: Double {
-        let cover = project.rangeEnd
-        let reach = project.jumpyStart.map { cover - $0 } ?? project.smoothStart.map { 2 * (cover - $0) } ?? 0
-        return max(reach * 1.4, project.span * 1.25, 2)
+        max(SegmentPlanner.startReach, project.span * 1.05)
     }
 
     private var startRow: some View {
@@ -289,6 +292,9 @@ struct TrimBar: View {
                         filmstrip(zoom.images, width: inner, height: startHeight).transition(.opacity)
                     } else {
                         LoadingStrip(slots: 16).frame(width: inner, height: startHeight).transition(.opacity)
+                        // the last window's pictures where they belong in this one, until its own come (11-20: the row
+                        // widens as the search finds how far back it stays smooth, 「选起点又加载了一下」)
+                        if let zoom = zoomStrip { placedStrip(zoom, x: { x($0) - handleWidth }) }
                     }
                     Rectangle().fill(.black.opacity(0.55)).frame(width: max(0, startX - handleWidth), height: startHeight)
                 }
@@ -298,7 +304,7 @@ struct TrimBar: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .offset(x: handleWidth, y: top)
                 .contentShape(Rectangle())
-                .gesture(startDrag(time: time, shown: shown))
+                .gesture(startDrag(shown: shown))
 
                 // the chosen stretch, and its handle
                 UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 7, topTrailingRadius: 7)
@@ -307,7 +313,7 @@ struct TrimBar: View {
                     .offset(x: startX, y: top)
                     .allowsHitTesting(false)
                 handle.offset(x: startX - handleWidth, y: top)
-                    .gesture(startDrag(time: time, shown: shown))
+                    .gesture(startDrag(shown: shown))
                     .help("起点：从这里到封面整段都会播，离封面越近越平滑（I）")
                     .accessibilityElement()
                     .accessibilityLabel("起点")
@@ -326,28 +332,69 @@ struct TrimBar: View {
                 }
             }
             .coordinateSpace(name: "start")
+            .onAppear { startRowWidth = inner }
+            .onChange(of: inner) { startRowWidth = inner }
+        }
+        .task(id: startZoomed ? frozenWindow : nil) {
+            // zoomed in on the start: pictures for that window, once it settles while panning
+            guard startZoomed, let window = frozenWindow, let asset = project.previewAsset else { return }
+            try? await Task.sleep(for: .milliseconds(150))
+            if Task.isCancelled { return }
+            let images = await PreviewImages.filmstrip(of: asset, from: window.lowerBound, to: window.upperBound, count: 16)
+            if !Task.isCancelled, !images.isEmpty { withAnimation(.easeOut(duration: 0.2)) { zoomStrip = (window, images) } }
         }
         .task(id: zoomWindow) {
             // pictures for the window, after the range has stopped moving
-            guard let asset = project.previewAsset else { return }
+            guard project.previewAsset != nil else { return }
             let target = zoomWindow
             if zoomStrip?.window == target { return }
             try? await Task.sleep(for: .milliseconds(250))
-            if Task.isCancelled { return }
+            // from the 4K original, after the cover's first picture (the decoder does one thing at a time at full speed);
+            // from the editing copy, at once (11-20 「动完封面之后，选起点种的预览图不能马上出吗？」)
+            while project.answersAreStale, project.source?.proxy == nil, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard !Task.isCancelled, let asset = project.previewAsset else { return }
             let images = await PreviewImages.filmstrip(of: asset, from: target.lowerBound, to: target.upperBound, count: 16)
             if !Task.isCancelled, !images.isEmpty { withAnimation(.easeOut(duration: 0.2)) { zoomStrip = (target, images) } }
         }
     }
 
-    private func startDrag(time: @escaping (CGFloat) -> Double, shown: ClosedRange<Double>) -> some Gesture {
+    /// The start handle (or the start row) dragged: the start follows the pointer on a scale that stays put. Past the
+    /// left end the row widens (zoomed in, it pans), by how far the pointer moved each time; held still, it zooms in on
+    /// the start for picking one source frame, and zooms back out on release (like the cover row, like Photos).
+    private func startDrag(shown: ClosedRange<Double>) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .named("start"))
             .onChanged { g in
                 if dragging == nil {
                     begin(.start)
                     frozenWindow = shown
                     project.startIsAuto = false
+                    lastX = g.location.x - handleWidth
                 }
-                project.rangeStart = max(0, min(time(g.location.x), project.rangeEnd - project.minSpan))
+                let inner = max(1, startRowWidth)
+                let px = g.location.x - handleWidth, previousX = lastX
+                lastX = px
+                if !startZoomed, holdTimer == nil || abs(px - holdX) > 3 { holdStartStill(at: px) }
+                guard var window = frozenWindow else { return }
+                let cover = project.rangeEnd
+                let span = window.upperBound - window.lowerBound
+                if px < 0, px < previousX {
+                    let push = Double((min(previousX, 0) - px) / inner) * span
+                    let lo = max(0, window.lowerBound - push)
+                    window = startZoomed ? lo...(lo + span) : lo...window.upperBound
+                } else if startZoomed, px > inner, px > previousX {
+                    let push = Double((px - max(previousX, inner)) / inner) * span
+                    let hi = min(cover, window.upperBound + push)
+                    window = (hi - span)...hi
+                }
+                frozenWindow = window
+                var t = window.lowerBound + Double(min(max(0, px / inner), 1)) * (window.upperBound - window.lowerBound)
+                if startZoomed {
+                    let fps = max(1, project.source?.frameRate ?? 30)
+                    t = ((t * fps).rounded(.down) + 0.5) / fps
+                }
+                project.rangeStart = max(0, min(t, cover - project.minSpan))
                 if fromLock {
                     project.scrub(at: project.rangeStart)                   // the start's picture while it is dragged
                 } else {
@@ -357,12 +404,40 @@ struct TrimBar: View {
             .onEnded { _ in end("调整起点") }
     }
 
+    /// Restarts the wait for a hold on the start; once the pointer has rested, the start row zooms in on the start,
+    /// `pointsPerFrame` per source frame, with the start staying under the pointer.
+    private func holdStartStill(at px: CGFloat) {
+        holdTimer?.cancel()
+        holdX = px
+        holdTimer = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled, dragging == .start, !startZoomed, let window = frozenWindow else { return }
+            let inner = max(1, startRowWidth), fps = max(1, project.source?.frameRate ?? 30)
+            let span = min(window.upperBound - window.lowerBound, Double(inner / pointsPerFrame) / fps)
+            guard span < (window.upperBound - window.lowerBound) * 0.8 else { return }       // already that fine
+            let cover = project.rangeEnd
+            let lo = min(max(0, project.rangeStart - Double(min(max(0, lastX / inner), 1)) * span), cover - span)
+            withAnimation(.spring(duration: 0.35)) { frozenWindow = lo...(lo + span); startZoomed = true }
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        }
+    }
+
+    /// Where the planned frames are: the plan's times, or while a moved start's plan is still coming, the same pattern
+    /// stretched from the new start to the cover, so the marks follow the handle (11-20 「10帧在时间轴上的标记没有实时
+    /// 跟随时间轴」). The plan's own times replace them when it is in.
+    private var tickTimes: [Double] {
+        let times = project.times
+        guard !project.planIsCurrent, let first = times.first, let last = times.last, last - first > 1e-6 else { return times }
+        let scale = (last - project.rangeStart) / (last - first)
+        return times.map { last - (last - $0) * scale }
+    }
+
     /// The 11 planned frames above the start row; the cover is the tall yellow one. Pointing at one shows its picture,
     /// clicking opens the details at that frame. Shown only while the pointer is on the bar.
     private func ticks(x: @escaping (Double) -> CGFloat) -> some View {
         ZStack(alignment: .topLeading) {
-            ForEach(Array(project.times.enumerated()), id: \.offset) { i, t in
-                let isCover = i == project.times.count - 1
+            ForEach(Array(tickTimes.enumerated()), id: \.offset) { i, t in
+                let isCover = i == tickTimes.count - 1
                 let lit = hoverTick == i
                 Capsule().fill(isCover ? Color.yellow : Color.white.opacity(lit ? 1 : 0.8))
                     .frame(width: lit ? 3 : 2, height: isCover || lit ? 11 : 7)
@@ -398,10 +473,24 @@ struct TrimBar: View {
 
     /// How the animation feels for a start at `t`: the same thresholds as the sidebar (SegmentPlanner.Feel).
     private func zone(at t: Double) -> Zone {
-        guard !coverIsMoving, t <= project.rangeEnd, let smooth = project.smoothStart else { return .unknown }
-        if t >= smooth - 0.005 { return .smooth }
-        guard let jumpy = project.jumpyStart else { return .unknown }
-        return t >= jumpy - 0.005 ? .jumpy : .flashy
+        guard t <= project.rangeEnd, let band = shownBands().first(where: { t >= $0.from - 0.005 }) else { return .unknown }
+        return zone(band.feel)
+    }
+
+    /// The bands the bar shows: none while the cover moves or its search has not reached the start row's default window
+    /// yet; then all of them at once.
+    private func shownBands() -> [SegmentPlanner.FeelBand] {
+        guard !coverIsMoving, let bands = project.feelBands, let farthest = bands.last else { return [] }
+        let cover = project.rangeEnd
+        return farthest.from <= max(0, cover - SegmentPlanner.startReach) + 1e-6 ? bands : []
+    }
+
+    private func zone(_ feel: SegmentPlanner.Feel) -> Zone {
+        switch feel {
+        case .smooth: .smooth
+        case .jumpy: .jumpy
+        case .flashy: .flashy
+        }
     }
 
     private func color(_ zone: Zone) -> Color {
@@ -422,27 +511,37 @@ struct TrimBar: View {
         }
     }
 
+    /// The colour bar: one piece, shown whole once its stretch is measured (with the picture and the automatic start);
+    /// until then, and past what is measured when the row is widened, a placeholder that says it is still being worked
+    /// out (11-20, the user: 「橙色和绿色的颜色会从各自的起点出发而不是作为一个整体」「颜色条的出现时机也让人很奇怪」).
     private func zoneBar(shown: ClosedRange<Double>, x: @escaping (Double) -> CGFloat) -> some View {
         let lo = shown.lowerBound, hi = shown.upperBound
-        // measured for the old cover while the cover is dragged: grey (还在计算) until the new plan, not misplaced
-        let jumpyStart = coverIsMoving ? nil : project.jumpyStart
-        let smoothStart = coverIsMoving ? nil : project.smoothStart
-        let jumpy = min(max(jumpyStart ?? lo, lo), hi), smooth = min(max(smoothStart ?? hi, lo), hi)
         let origin = x(lo), width = x(hi) - x(lo)
-        let bands: [(from: Double, to: Double, zone: Zone)] = [
-            (lo, jumpy, jumpyStart == nil ? .unknown : .flashy),
-            (jumpy, smooth, jumpyStart == nil ? .unknown : .jumpy),
-            (smooth, hi, smoothStart == nil ? .unknown : .smooth),
-        ]
+        let all = shownBands()
+        let bands: [(from: Double, to: Double, zone: Zone)] = all.compactMap { b in
+            let from = max(b.from, lo), to = min(b.to, hi)
+            return to > from ? (from, to, zone(b.feel)) : nil
+        }
+        // the part not measured (yet): everything, or what lies past the measured stretch
+        let pendingTo = all.last.map { min(hi, max(lo, $0.from)) } ?? hi
         return ZStack(alignment: .topLeading) {
-            ForEach(Array(bands.enumerated()), id: \.offset) { _, b in
-                Rectangle().fill(color(b.zone))
-                    .frame(width: max(0, x(b.to) - x(b.from)), height: zoneHeight)
-                    .offset(x: x(b.from) - origin)
+            if !bands.isEmpty {
+                ZStack(alignment: .topLeading) {
+                    ForEach(Array(bands.enumerated()), id: \.offset) { _, b in
+                        Rectangle().fill(color(b.zone))
+                            .frame(width: max(0, x(b.to) - x(b.from)), height: zoneHeight)
+                            .offset(x: x(b.from) - origin)
+                    }
+                }
+                .transition(.opacity)
+            }
+            if pendingTo > lo + 1e-6 {
+                PendingBar().frame(width: max(0, x(pendingTo) - origin), height: zoneHeight).transition(.opacity)
             }
         }
         .frame(width: width, height: zoneHeight, alignment: .topLeading)
         .clipShape(Capsule())
+        .animation(.easeOut(duration: 0.3), value: bands.isEmpty)
         // the bar itself, plus a few points above and below like a slider's track: 6 pt alone is hard to point at
         .padding(.vertical, 5)
         .contentShape(Rectangle())
@@ -475,6 +574,21 @@ struct TrimBar: View {
     }
 
     // MARK: pieces
+
+    /// `strip`'s pictures each at the stretch of time it stands for, `x` giving positions in the strip's frame.
+    private func placedStrip(_ strip: (window: ClosedRange<Double>, images: [CGImage]), x: @escaping (Double) -> CGFloat) -> some View {
+        let n = max(1, strip.images.count)
+        let slot = (strip.window.upperBound - strip.window.lowerBound) / Double(n)
+        return ZStack(alignment: .topLeading) {
+            ForEach(Array(strip.images.enumerated()), id: \.offset) { i, image in
+                let from = strip.window.lowerBound + Double(i) * slot
+                Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fill)
+                    .frame(width: max(1, x(from + slot) - x(from)), height: startHeight).clipped()
+                    .offset(x: x(from))
+            }
+        }
+        .allowsHitTesting(false)
+    }
 
     private func filmstrip(_ images: [CGImage], width: CGFloat, height: CGFloat) -> some View {
         HStack(spacing: 0) {
@@ -543,8 +657,6 @@ struct TrimBar: View {
         dragging = what
         coverAtBegin = project.rangeEnd
         spanAtBegin = project.span
-        // held from the first cover drag until that cover's plan answers; a second drag meanwhile keeps it
-        if what == .cover, coverDragWidth == nil { coverDragWidth = zoomWidth }
         fromLock = project.viewMode == .lockScreen
         project.pause()
         project.beginEdit()
@@ -576,10 +688,10 @@ struct TrimBar: View {
         // the cover's picture stays until the new plan shows it; the start's goes, back to the cover
         if fromLock { project.endScrub(keepPicture: dragging == .cover && project.rangeEnd != coverAtBegin) }
         project.endEdit(undoName)
+        // planned while the start rested: play it now (otherwise it plays when its plan comes in)
+        if fromLock, dragging == .start, project.planIsCurrent { project.wakeCount += 1 }
         dragging = nil
-        withAnimation(.easeOut(duration: 0.25)) { frozenWindow = nil }
-        // a moved cover keeps the start row's width until its own plan has answered (`onChange(of: coverIsMoving)`):
-        // in between, the old cover's starts made the row jump wider and back (11-18 「松开光标之后会向左边跳一下」)
+        withAnimation(.spring(duration: 0.35)) { frozenWindow = nil; startZoomed = false }
     }
 
     /// VoiceOver: one source frame per step.
@@ -627,6 +739,30 @@ private struct LoadingStrip: View {
             withAnimation(.linear(duration: 1.1).repeatForever(autoreverses: false)) { phase = 1 }
         }
         .accessibilityLabel("正在载入画面")
+    }
+}
+
+/// The colour bar while it is being worked out: grey, with a light passing along it.
+private struct PendingBar: View {
+    @State private var phase: CGFloat = -0.3
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { g in
+            Rectangle().fill(.white.opacity(0.14))
+                .overlay {
+                    LinearGradient(colors: [.clear, .white.opacity(0.35), .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: max(40, g.size.width * 0.25))
+                        .offset(x: phase * g.size.width)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .opacity(reduceMotion ? 0 : 1)
+                }
+                .clipped()
+        }
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) { phase = 1 }
+        }
     }
 }
 

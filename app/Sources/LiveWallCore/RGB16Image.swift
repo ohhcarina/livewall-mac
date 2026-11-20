@@ -170,6 +170,26 @@ public struct RGB16Image {
         }
         return sum / Double(n * 3) / 257.0
     }
+
+    /// `meanAbsDiff` of the cell that changed most when the image is cut into `grid` x `grid` cells: what one region did,
+    /// which the whole-frame mean dilutes when the rest stands still (11-18, rounds 46-48). Same size required.
+    public func localMaxDiff(_ other: RGB16Image, grid: Int = 8) -> Double {
+        precondition(width == other.width && height == other.height)
+        var sums = [Double](repeating: 0, count: grid * grid), counts = [Int](repeating: 0, count: grid * grid)
+        for y in 0..<height {
+            let row = (y * grid / height) * grid
+            var i = y * width * 4
+            for x in 0..<width {
+                let cell = row + x * grid / width
+                sums[cell] += abs(Double(pixels[i]) - Double(other.pixels[i]))
+                    + abs(Double(pixels[i + 1]) - Double(other.pixels[i + 1]))
+                    + abs(Double(pixels[i + 2]) - Double(other.pixels[i + 2]))
+                counts[cell] += 1
+                i += 4
+            }
+        }
+        return zip(sums, counts).map { $1 == 0 ? 0 : $0 / Double($1 * 3) / 257.0 }.max() ?? 0
+    }
 }
 
 public enum EngineError: Error, CustomStringConvertible {

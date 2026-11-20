@@ -44,7 +44,8 @@ public enum SegmentPlanner {
         /// 11 source times (mid-frame), from the start to the cover: even, except the last frames, which close in on
         /// the cover; the frame before the cover may be the cover itself (`holdAbove`).
         public var times: [Double]
-        /// Mixing toward the cover per frame (`WallpaperRecipe.coverBlend`): no longer used by the App (all zero).
+        /// Mixing toward the cover per frame (`WallpaperRecipe.coverBlend`): zero unless one region stays too far from
+        /// the cover after the tail is picked (`TailBlend.localTailCap`).
         public var blend: [Double]
         /// Checks on the frames as they will play, cropped like the wallpaper.
         public var report: WindowReport
@@ -64,38 +65,22 @@ public enum SegmentPlanner {
                             crop: CGRect = WindowPlanner.fullFrame) async throws -> Plan {
         guard cover > start else { throw EngineError.invalid("the selected range is empty") }
         let fps = max(1, source.frameRate)
-        var coverTime = cover, startTime = start
         let small = WindowPlanner.decodeWidth(sampleWidth, crop: crop)
         let shrink = { (image: RGB16Image) in try WindowPlanner.cropped(image, to: crop, width: sampleWidth) }
-        // a freeze longer than the frames looked at one by one is walked back in several passes
-        let passes = 5
-        var pickedCover: RGB16Image?
-        for attempt in 0..<passes {
-            let even = frameIndices(start: startTime, cover: coverTime, frameRate: fps, duration: source.duration)
+        // the cover is the frame the person picked, also on a still or repeated stretch: 11-18 「用户有可能会想要最后不动
+        // ……可以按需提醒但是不要直接做」. Walking it back to where the picture stopped (from R5-1, 11-11) also caught what
+        // was still settling (the bottom of 「auto」 on the GTA logo, 11-18 「auto的底部都是虚的」), and its reason did not
+        // hold: identical last frames turned motion on (R6-3, R7-1, R46-3 with all 22 frames the same)
+        do {
+            let even = frameIndices(start: start, cover: cover, frameRate: fps, duration: source.duration)
             let cover = even[10]
-            // the last frames before the cover, one by one: repeats at the cover, and where the step into it can go
+            // the last frames before the cover, one by one: where the step into it can go
             let nearFirst = max(0, cover - nearCount)
             let near = try await source.thumbnails(from: mid(nearFirst, fps), to: mid(cover, fps), fps: fps,
                                                    width: small, transform: shrink).map(\.image)
             try Task.checkCancellation()
             guard near.count > 1 else { throw EngineError.invalid("no frames decoded before the cover") }
             let nearImage = { (index: Int) in near[min(max(0, index - nearFirst), near.count - 1)] }
-            // a cover on a repeated or frozen frame becomes the first frame showing that picture. Compared with the cover,
-            // not with the next frame: a slow reveal moves under `sameFrame` per frame yet adds up (11-18: a logo whose
-            // background faded in over 3 s had the cover walked back 96 frames, to before the background showed)
-            // (later passes keep comparing with the picked cover's picture, or each pass would re-anchor and chain again)
-            let reference = pickedCover ?? nearImage(cover)
-            pickedCover = reference
-            var repeats = 0
-            while cover - repeats - 1 >= max(10, nearFirst),
-                  reference.meanAbsDiff(nearImage(cover - repeats - 1)) < sameFrame { repeats += 1 }
-            if attempt < passes - 1, repeats > 0 {
-                // the start stays where the person put it (11-18: 「用户有可能会想要最后不动……不要直接做」): what plays
-                // stays inside the chosen stretch, from its start to where the picture stops, then rests there.
-                // `frameIndices` still keeps 10 frames before the cover, so a 10-frame stretch moves whole (11-12 R8)
-                coverTime = mid(cover - repeats, fps)
-                continue
-            }
 
             // what the tail is picked from: frames from the 7th pick to the cover (the last 4 only move after it), at
             // most `poolCount` of them, evenly thinned on long stretches (11-12 review: every frame of a minute-long
@@ -130,11 +115,14 @@ public enum SegmentPlanner {
                 }
             }
             let times = picks.map { mid($0, fps) }
-            let frames = try await WindowPlanner.windowFrames(source: source, times: times, crop: crop)
-            return Plan(times: times, blend: Array(repeating: 0, count: times.count),
-                        report: try WindowAnalysis.analyze(frames: frames))
+            var frames = try await WindowPlanner.windowFrames(source: source, times: times, crop: crop)
+            // picked as close as time allows, one region may still be far from the cover: something popping in over the
+            // last frames on a still picture (11-18 GTA logo, rounds 46-48: the mean read 3.5 and motion did not turn
+            // on). Only then the tail is mixed; it appears in place, so the mixing reads as the fade it already was
+            let blend = TailBlend.alphas(window: frames, localAllowed: TailBlend.localTailCap)
+            try TailBlend.apply(&frames, alphas: blend)
+            return Plan(times: times, blend: blend, report: try WindowAnalysis.analyze(frames: frames))
         }
-        throw EngineError.invalid("could not plan the frames")
     }
 
     /// Distance limits for the last 4 frames before the cover (second-to-last first): `tailTargets` from the window
@@ -177,54 +165,175 @@ public enum SegmentPlanner {
         return picks
     }
 
-    /// The earliest start that still looks smooth for this cover: the span grows from 10 source frames by 15 % at a
+    /// The earliest start that still looks smooth for this cover: the span grows from 10 source frames by `growth` at a
     /// time and stops at the first one whose largest step (with the tail picked as `plan` does) passes `ceiling`. No
     /// upper limit on how far back (11-11, the user: 「往前取多少让用户决定吧，我们不做限制」); far stretches are sampled more
     /// sparsely and only decoded when everything closer was smooth.
     public static func smoothestStart(source: FrameSource, cover: Double, crop: CGRect = WindowPlanner.fullFrame,
                                       ceiling: Double = smoothStep) async throws -> Double {
-        let minSpan = 10 / max(1, source.frameRate)
-        guard cover > minSpan else { return 0 }
-        // sampling tiers: (how far back, samples per second)
-        let tiers: [(back: Double, fps: Double)] = [(2, source.frameRate), (20, min(source.frameRate, 10)), (.infinity, 2)]
-        var best = cover - minSpan
-        var span = minSpan
-        tierLoop: for tier in tiers {
-            let from = max(0, cover - tier.back)
-            let fps = tier.back.isInfinite ? min(2, 400 / max(1, cover)) : tier.fps
-            let samples = try await source.thumbnails(from: from, to: cover, fps: fps,
-                                                      width: WindowPlanner.decodeWidth(sampleWidth, crop: crop)) {
-                try WindowPlanner.cropped($0, to: crop, width: sampleWidth)
-            }
-            try Task.checkCancellation()
-            guard samples.count > 1 else { break }
-            while span <= cover - from + 1e-6 {
-                let times = (0...10).map { cover - span * Double(10 - $0) / 10 }
-                if sampledMaxStep(samples, at: times) > ceiling { break tierLoop }
-                best = cover - span
-                if span >= cover - 1e-6 { break tierLoop }
-                span = min(cover, span * 1.15)
-            }
+        var sweep = StartSweep(source: source, cover: cover, crop: crop)
+        while !sweep.isComplete, !sweep.foundRough(above: ceiling), !sweep.reached(startReach) {
+            try await sweep.measureNextTier(source: source)
         }
+        return try await smoothestStart(source: source, sweep: sweep, ceiling: ceiling)
+    }
+
+    /// How far back the automatic start goes at most, and what the App's start row shows (#0033, 11-20): the near
+    /// tiers' reach, so the automatic start and the colour bar under the row are known together and never move after.
+    /// Footage smooth for longer still lets the person drag further; 20 s already plays 27× fast.
+    public static let startReach = 20.0
+
+    /// The smoothest start as far as `sweep` has measured, at most `startReach` back: final once
+    /// `StartSweep.knowsSmoothestStart`, otherwise the farthest start measured so far, all of which were smooth.
+    public static func smoothestStart(source: FrameSource, sweep: StartSweep, ceiling: Double = smoothStep) async throws -> Double {
+        let minSpan = 10 / max(1, source.frameRate)
+        let cover = sweep.cover
+        guard cover > minSpan else { return 0 }
+        // up to the first rough span: farther smooth ones are past a jumpy stretch
+        let reached = sweep.points.prefix { $0.maxStep <= ceiling && cover - $0.start <= startReach + 1e-6 }
+        let best = reached.last?.start ?? cover - minSpan
         // the samples are small; measured the way the check does, fine texture can read higher: back off until it fits
         var start = max(0, best)
         for _ in 0..<4 {
-            let p = try await plan(source: source, start: start, cover: cover, crop: crop)
+            let p = try await plan(source: source, start: start, cover: cover, crop: sweep.crop)
             guard p.maxStep > ceiling, cover - start > minSpan * 1.2 else { break }
             start = cover - (cover - start) * 0.85
         }
         return start
     }
 
+    /// How starts in `from..<to` feel: one stretch of the colour bar under the start row.
+    public struct FeelBand: Equatable {
+        public var from: Double
+        public var to: Double
+        public var feel: Feel
+    }
+
+    /// Bands of `Feel` from 0:00 to the cover (nearest the cover first), measured like `smoothestStart` but without
+    /// stopping at the first rough span. How a start feels is not monotonic in how far back it is: 11-18 GTA logo, some
+    /// starts put a frame on the instant the logo lit up and stepped over 12, a start 5.6 s back stepped 11.2; the bar,
+    /// which painted everything past the first rough span orange and red, sat next to a sidebar saying 平滑.
+    public static func feelBands(source: FrameSource, cover: Double, crop: CGRect = WindowPlanner.fullFrame) async throws -> [FeelBand] {
+        var sweep = StartSweep(source: source, cover: cover, crop: crop)
+        while !sweep.isComplete { try await sweep.measureNextTier(source: source) }
+        return feelBands(sweep)
+    }
+
+    /// The bands as far as `sweep` has measured: from the cover back `sweep.measuredBack` (to 0:00 once complete).
+    public static func feelBands(_ sweep: StartSweep) -> [FeelBand] {
+        let cover = sweep.cover
+        // nothing to measure (cover in the first 10 frames, or too few samples): smooth, as `smoothestStart` answers 0
+        // there. Never empty: an empty answer is not asked again and left the bar grey (11-18 review)
+        let whole = [FeelBand(from: 0, to: max(0, cover), feel: .smooth)]
+        let points = sweep.points
+        guard !points.isEmpty else { return sweep.isComplete ? whole : [] }
+        var bands: [FeelBand] = []
+        var upper = cover
+        for (k, point) in points.enumerated() {
+            // each measured start speaks for the stretch halfway to its neighbours; the farthest also for what is left,
+            // to 0:00 once there is no more to measure, until then to where its tier reaches (at most 5 % farther)
+            let farthest = k == points.count - 1
+            let lower = farthest ? (sweep.isComplete ? 0 : max(0, cover - sweep.measuredBack))
+                                 : max(0, (point.start + points[k + 1].start) / 2)
+            let f = feel(maxStep: point.maxStep)
+            if let last = bands.last, last.feel == f {
+                bands[bands.count - 1].from = lower
+            } else {
+                bands.append(FeelBand(from: lower, to: upper, feel: f))
+            }
+            upper = lower
+        }
+        return bands
+    }
+
+    /// How much longer each measured span is than the one before: 5 %, so the colour bar's bands sit within a few
+    /// percent of where the sidebar's exact plan changes its words (15 % left a 5.6 s start judged as 6.3 s, 11-18).
+    static let growth = 1.05
+
+    /// Starts from 10 frames back toward 0:00, `growth` farther each, with the largest step of the frames `plan` would
+    /// pick (on small samples), measured one sampling tier at a time, nearest first (#0033, 11-19: the App shows what
+    /// the near tiers say within seconds and goes on further back after, 「先只算5秒内的先出来，然后再接着考虑之前的」).
+    /// Tiers: (how far back, samples per second). 2-8 s back at up to 30 fps: where starts usually go, and 10 fps there
+    /// put a 5.6 s start on frames 3 apart from the plan's (11-18 GTA logo); farther back 10 fps, so a tier holds at most
+    /// ~200 samples (review: 30 fps out to 20 s was ~600, a quarter gigabyte for portrait crops); the rest at about 2 a
+    /// second.
+    public struct StartSweep {
+        public let cover: Double
+        public let crop: CGRect
+        /// Nearest the cover first.
+        public private(set) var points: [(start: Double, maxStep: Double)] = []
+        /// No more to measure: back to 0:00, or nothing left to sample.
+        public private(set) var isComplete = false
+        private var tier = 0
+        private var span: Double
+        private let tiers: [(back: Double, fps: Double)]
+
+        public init(source: FrameSource, cover: Double, crop: CGRect = WindowPlanner.fullFrame) {
+            self.cover = cover
+            self.crop = crop
+            let minSpan = 10 / max(1, source.frameRate)
+            span = minSpan
+            tiers = [(2, source.frameRate), (8, min(source.frameRate, 30)), (20, min(source.frameRate, 10)), (.infinity, 2)]
+            isComplete = cover <= minSpan
+        }
+
+        /// The tier left is the one over the whole rest of the video, sampled about twice a second.
+        public var onlyFarLeft: Bool { tier == tiers.count - 1 }
+
+        /// How far back from the cover the starts measured so far go.
+        public var measuredFrom: Double { points.last?.start ?? cover }
+
+        public func foundRough(above ceiling: Double = smoothStep) -> Bool { points.contains { $0.maxStep > ceiling } }
+
+        /// How far back from the cover the tiers measured so far reach (each tier's last start falls up to 5 % short
+        /// of its reach, as the spans grow 5 % at a time).
+        public private(set) var measuredBack = 0.0
+
+        /// Measured `seconds` back from the cover (or to 0:00).
+        public func reached(_ seconds: Double) -> Bool { isComplete || measuredBack >= min(seconds, cover) - 1e-6 }
+
+        /// The smoothest start is known (`SegmentPlanner.smoothestStart(source:sweep:)` will not move with more tiers).
+        public var knowsSmoothestStart: Bool { foundRough() || reached(startReach) }
+
+        /// Measures the next tier. `copy` (the editing copy, at most 30 frames a second) samples the 20 s tier and the
+        /// farthest one in place of `source` when given: they sample at most 10 a second, a frame near each sample time
+        /// is all they ask for, and the original picks those from its 30 fps layer too (#0033: the same answers on 7
+        /// videos, 11-20). The 8 s tier samples 30 a second from the original's 60 fps layer, which the copy lacks (it
+        /// moved answers by a sample); the 2 s tier needs every frame.
+        public mutating func measureNextTier(source: FrameSource, copy: FrameSource? = nil) async throws {
+            guard !isComplete, tier < tiers.count else { isComplete = true; return }
+            let (back, tierFPS) = tiers[tier]
+            tier += 1
+            defer { measuredBack = isComplete ? cover : max(measuredBack, min(back, cover)) }
+            let from = max(0, cover - back)
+            let fps = back.isInfinite ? min(2, 400 / max(1, cover)) : tierFPS
+            let width = WindowPlanner.decodeWidth(sampleWidth, crop: crop)
+            let crop = self.crop
+            let shrink = { (image: RGB16Image) in try WindowPlanner.cropped(image, to: crop, width: sampleWidth) }
+            // a coarse look: any frame near each sample time will do, so high-frame-rate streams skip frames (#0033)
+            let samples = if tier > 2, let copy {
+                try await copy.thumbnails(from: from, to: cover, fps: fps, width: width, transform: shrink)
+            } else {
+                try await source.thumbnails(from: from, to: cover, fps: fps, width: width, exact: false, transform: shrink)
+            }
+            try Task.checkCancellation()
+            guard samples.count > 1 else { isComplete = true; return }
+            while span <= cover - from + 1e-6 {
+                let times = (0...10).map { cover - span * Double(10 - $0) / 10 }
+                points.append((cover - span, sampledMaxStep(samples, at: times)))
+                if span >= cover - 1e-6 { isComplete = true; return }
+                span = min(cover, span * growth)
+            }
+            if tier == tiers.count { isComplete = true }
+        }
+    }
+
     static let sampleWidth = 160
-    /// Frames before the cover looked at one by one (repeats, the step into the cover).
+    /// Frames before the cover looked at one by one (the step into the cover).
     static let nearCount = 24
     /// Most frames decoded to pick the rest of the tail from.
     static let poolCount = 160
 
-    /// Below this (WindowAnalysis units) two frames are the same picture: repeated frames measure about 0.1 (codec
-    /// noise), the smallest real step seen in the samples is about 2.
-    static let sameFrame = 1.0
 
     private static func mid(_ index: Int, _ fps: Double) -> Double { (Double(index) + 0.5) / fps }
 

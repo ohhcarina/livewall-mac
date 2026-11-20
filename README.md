@@ -26,12 +26,13 @@ iOS 17 起，锁屏可以用实况照片当壁纸，点亮屏幕时动一下。�
 ## 特性
 
 - **真正会动**：按真机测出的规则挑帧、编码，导出的壁纸点亮锁屏就动，不会只剩一张静态图。
-- **自动挑最顺的一段**：你选封面，起点会自动放在「最远还顺」的地方，也可以自己拖。
+- **自动挑最顺的一段**：你选封面，起点会自动放在封面前 20 秒内「最远还顺」的地方，也可以自己拖。
 - **所见即所得**：锁屏预览带时间和日期，颜色条标出平滑、略有跳动、跳动明显，还会提示明暗闪烁。
 - **不偏色**：封面和视频都按 Display P3 写，动画结束时不会突然发青。
 - **适配多种屏幕**：面容 ID iPhone（默认）、iPhone Duo 内屏、iPhone SE、iPad、自定义比例；画面可以选「完整」（压窄，不丢内容）或「铺满」（裁切，不变形）。
 - **裁掉黑边**：在「视频」里拖黄色裁切框，去掉上下黑边或不要的部分（按住 ⇧ 保持比例，⌥ 两边一起收）。
-- **逐帧选封面**：拖封面时按住不动，时间轴放大到逐帧；4K、AV1 这类大视频导入时会先做一份编辑用的小副本，拖动不卡，导出仍用原片。
+- **逐帧选封面和起点**：拖封面或起点时按住不动，时间轴放大到逐帧；停住时预览换成原片里那一帧。
+- **长视频也快**：4K、240 fps、十几分钟的航拍，打开一两秒就能编辑；编辑用的小副本在后台做，拖动不卡，导出仍用原片。
 - **细节多的素材也能动**：4K 航拍这类画面会自动压低单帧数据量，避免超出锁屏的上限。
 - **纯本地**：不联网、不收集任何数据；只依赖系统框架，不需要 ffmpeg。
 
@@ -47,7 +48,7 @@ iOS 17 起，锁屏可以用实况照片当壁纸，点亮屏幕时动一下。�
 1. 把视频拖进窗口。
 2. 在右边选机型和适配方式（完整 / 铺满）。视频有黑边的话，切到「视频」拖黄色框裁掉。
 3. 在「选封面」那一行选停住的那一帧。锁屏点亮时只播它之前的 10 帧。
-4. 起点会自动放好，想要更长的动作就在「选起点」那一行往前拖，颜色条会告诉你顺不顺。
+4. 起点会自动放好，想要更长的动作就在「选起点」那一行往前拖（按住不动可以逐帧选，拖过左端会显示更早的部分），颜色条会告诉你顺不顺。
 5. 点「导出壁纸」，在弹窗里选「隔空投送」到 iPhone，或者「添加到『照片』」等 iCloud 同步。
 6. 在 iPhone 上打开「设置 › 墙纸 › 添加新墙纸 › 照片」，选这张实况。
 
@@ -119,7 +120,7 @@ swift run livewall-cli build <视频> --range 起,止 --aspect 0.4613 --name 名
 
 **LiveWall turns a video clip into a Live Photo wallpaper that actually moves on the iPhone lock screen.**
 
-Most home-made Live Photos end up as "Motion not available", or they stutter and shift colour when the lock screen plays them. The lock screen follows a set of undocumented rules: it plays only the 10 frames before the key photo, the last steps must ease into it, and there are limits on frame size, resolution and colour tags. LiveWall was built after working those rules out on real iPhones. You pick the moment; it picks the frames, encodes them and checks the result.
+Most home-made Live Photos end up as "Motion not available", or they stutter and shift colour when the lock screen plays them. The lock screen follows a set of undocumented rules: it plays only the 10 frames before the key photo, the last steps must ease into it, and there are limits on frame size, resolution and colour tags. LiveWall was built after working those rules out on real iPhones. You pick the moment; it picks the frames, encodes them and checks the result. Long 4K high-frame-rate clips open in seconds.
 
 - Download the notarized `.dmg` from [Releases](https://github.com/ohhcarina/livewall-mac/releases/latest). macOS 14 or later, Apple silicon and Intel.
 - The interface is in Chinese.

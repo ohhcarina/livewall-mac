@@ -186,9 +186,39 @@ final class Project {
 
     /// What the pictures on the timeline are taken from (the editing copy once there is one).
     var previewAsset: AVAsset? { source?.proxy?.asset ?? source?.asset }
-    /// While the editing copy is made on import: how far along (0...1); nil otherwise.
-    var proxyProgress: Double?
-    private var proxyGeneration = 0
+    /// The original, once `player` plays the editing copy (#0033): the copy has at most 30 frames a second, so whenever
+    /// the picture rests (paused, a drag held still) this one is seeked to the exact frame and shown over it.
+    private(set) var exactPlayer: AVPlayer?
+    /// `exactPlayer` shows the play head's frame: the video view puts it over the copy.
+    private(set) var exactShown = false
+    private var exactTask: Task<Void, Never>?
+    private var exactOutput: AVPlayerItemVideoOutput?
+    /// `refineScrub` is inside a seek of `exactPlayer`.
+    private var exactSeeking = false
+    private var proxyTask: Task<Void, Never>?
+    /// The editing copy for `source` is being made (or looked up): the farthest tier of the start search waits for it.
+    private var copyComing = false
+    /// Held while the person drags or the start search looks near the cover: the copy then pauses (`DecodeGate`). The
+    /// decoder does one stream at full speed, two each at half: 11-20 on 香港天际线 (no copy yet) the smoothest start came
+    /// at 36 s with the copy made alongside, at 26 s with it waiting, and the copy only 6 s later (68 s).
+    private var copyGate = DecodeGate()
+    /// No picture yet for the current cover (or crop): the trim bar's pictures and the copy wait for it.
+    private var awaitingPreview = false {
+        didSet { updateCopyGate() }
+    }
+    /// `runPlan` is measuring near the cover (not waiting for the copy for the farthest tier).
+    private var searchingNear = false {
+        didSet { updateCopyGate() }
+    }
+    private var planGeneration = 0
+    private func updateCopyGate() { copyGate.isHeld = awaitingPreview || searchingNear || editStart != nil }
+    /// Held from opening a video until its copy is made: a window behind others gets App Nap, which stretched the
+    /// copy's short waits about tenfold (11-18: 44 s from the command line, over 8 minutes in the app).
+    private var importActivity: NSObjectProtocol?
+    private func endImportActivity() {
+        if let importActivity { ProcessInfo.processInfo.endActivity(importActivity) }
+        importActivity = nil
+    }
 
     /// One answer for the toolbar button and the menu item.
     var canExport: Bool { source != nil && !isBusy && !frames.isEmpty && blockedReason == nil }
@@ -196,7 +226,10 @@ final class Project {
     // choices
     var rangeStart: Double = 0 { didSet { if oldValue != rangeStart { replan() } } }
     /// The start follows the cover, at the farthest still smooth point, until the person moves it themselves.
-    var startIsAuto = true
+    var startIsAuto = true {
+        // a start set by hand is not waiting for anything (review: the export waited, the hint stayed)
+        didSet { if !startIsAuto { startIsSettling = false } }
+    }
     var rangeEnd: Double = 0 { didSet { if oldValue != rangeEnd { replan() } } }
     var preset: ScreenPreset = .iphone {
         didSet {
@@ -254,12 +287,15 @@ final class Project {
     /// Mixing toward the cover per frame (what the export does), and how the planned stretch will feel.
     var blend: [Double] = []
     var feel: SegmentPlanner.Feel?
-    /// The farthest start that still looks smooth for the current cover and crop (nil until found).
+    /// The farthest start that still looks smooth for the current cover and crop, as far back as the search has measured
+    /// so far (`searchIsComplete`; nil until the nearest tier is measured).
     var smoothStart: Double?
-    /// The earliest start before it turns from 略有跳动 into 跳动明显 (same cover and crop as `smoothStart`), for the colour
-    /// bar under the start row. Found after the plan, so it never delays the preview.
-    var jumpyStart: Double?
-    /// The cover that `smoothStart`, `jumpyStart` and `times` were worked out for; nil while a new cover's are. The trim
+    /// How each start feels, 0:00 to the cover (same cover and crop as `smoothStart`), for the colour bar under the start
+    /// row: bands, not two thresholds, because how far back says little about how it feels (11-18 GTA logo: 5.6 s back
+    /// was smooth where 3 s back was not, and the bar said red next to a sidebar saying 平滑). Found after the plan, so
+    /// it never delays the preview.
+    var feelBands: [SegmentPlanner.FeelBand]?
+    /// The cover that `smoothStart`, `feelBands` and `times` were worked out for; nil while a new cover's are. The trim
     /// bar compares it with `rangeEnd` to know when what it shows of them is stale (11-18 review: one place for
     /// dragging, waiting for the plan and a failed plan).
     var answeredCover: Double?
@@ -295,7 +331,11 @@ final class Project {
     }
 
     private func chaseScrub() {
-        guard let player, let item = player.currentItem, let t = scrubPending, let source else { scrubSeeking = false; return }
+        guard let player, let item = player.currentItem, let t = scrubPending, let source else {
+            scrubSeeking = false
+            if !isScrubbing { detachScrubOutput() }     // the drag ended while the last seek was still running
+            return
+        }
         scrubPending = nil
         scrubSeeking = true
         let output: AVPlayerItemVideoOutput
@@ -303,15 +343,7 @@ final class Project {
             output = existing
         } else {
             // attached only while scrubbing (`endScrub` removes it): playback would otherwise convert every frame for it
-            var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-            if case .hdr = source.sourceColor {
-                // tone-mapped to SDR BT.709 like the plan's frames (`FrameSource.decoderSettings`), or HLG / PQ code
-                // values show washed out while dragging and jump on release (11-18 re-review)
-                settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                                                      AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                                                      AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
-            }
-            output = AVPlayerItemVideoOutput(outputSettings: settings)
+            output = AVPlayerItemVideoOutput(outputSettings: Self.scrubSettings(source))
             item.add(output)
             scrubOutput = output
         }
@@ -327,11 +359,59 @@ final class Project {
                         Self.scrubPicture(buffer, quarterTurns: turns, aspect: framing.aspect, mode: framing.mode, focus: framing.focus,
                                           area: framing.area)
                     }.value
-                    if self.scrubGeneration == generation, let image { self.scrubFrame = image; self.scrubShown = t }
+                    if self.scrubGeneration == generation, let image {
+                        self.scrubFrame = image; self.scrubShown = t
+                        if self.scrubPending == nil, self.exactPlayer != nil { self.refineScrub(t, generation: generation) }
+                    }
                 }
                 self.scrubSeeking = false
                 self.chaseScrub()                   // whatever came in meanwhile, from this drag or the next one
             }
+        }
+    }
+
+    private static func scrubSettings(_ source: FrameSource) -> [String: Any] {
+        var settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        if case .hdr = source.sourceColor {
+            // tone-mapped to SDR BT.709 like the plan's frames (`FrameSource.decoderSettings`), or HLG / PQ code
+            // values show washed out while dragging and jump on release (11-18 re-review)
+            settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                                                  AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                                                  AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
+        }
+        return settings
+    }
+
+    /// The drag rests on `t`: the copy's picture there may be a frame or more off (it keeps 30 a second), so put the
+    /// original's frame in its place (#0033: picking one exact frame).
+    private func refineScrub(_ t: Double, generation: Int) {
+        guard let exactPlayer, let item = exactPlayer.currentItem, let source else { return }
+        let framing = (aspect: aspect, mode: mode, focus: CGPoint(x: focusX, y: focusY), area: area)
+        let turns = source.quarterTurns
+        exactTask?.cancel()
+        exactTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard let self, !Task.isCancelled, self.scrubGeneration == generation, self.scrubShown == t,
+                  self.scrubPending == nil else { return }
+            let output: AVPlayerItemVideoOutput
+            if let existing = self.exactOutput, item.outputs.contains(existing) {
+                output = existing
+            } else {
+                output = AVPlayerItemVideoOutput(outputSettings: Self.scrubSettings(source))
+                item.add(output)
+                self.exactOutput = output
+            }
+            let target = CMTime(seconds: t, preferredTimescale: 600)
+            self.exactSeeking = true
+            let finished = await exactPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+            self.exactSeeking = false
+            if !self.isScrubbing { self.detachExactOutput() }          // the drag ended meanwhile (see `endScrub`)
+            guard finished, !Task.isCancelled, let buffer = await Self.waitForFrame(output, at: target) else { return }
+            let image = await Task.detached(priority: .userInitiated) {
+                Self.scrubPicture(buffer, quarterTurns: turns, aspect: framing.aspect, mode: framing.mode, focus: framing.focus,
+                                  area: framing.area)
+            }.value
+            if self.scrubGeneration == generation, self.scrubShown == t, let image { self.scrubFrame = image }
         }
     }
 
@@ -370,11 +450,24 @@ final class Project {
         scrubPending = nil
         scrubShown = nil
         isScrubbing = false
-        if let output = scrubOutput {
-            player?.currentItem?.remove(output)
-            scrubOutput = nil
-        }
+        // not under a seek that is still running: its callback then never comes, `scrubSeeking` stays set and no later
+        // drag shows a picture (11-19, 「设备预览画面不动」: on the 4K 240 fps original a seek takes 0.1 s, so nearly every
+        // release landed in one). `chaseScrub` takes the output off when that seek is back.
+        if !scrubSeeking { detachScrubOutput() }
+        if !exactSeeking { detachExactOutput() }
         if !keepPicture { scrubFrame = nil }
+    }
+
+    private func detachScrubOutput() {
+        guard let output = scrubOutput else { return }
+        player?.currentItem?.remove(output)
+        scrubOutput = nil
+    }
+
+    private func detachExactOutput() {
+        guard let output = exactOutput else { return }
+        exactPlayer?.currentItem?.remove(output)
+        exactOutput = nil
     }
     private var smoothKey: SmoothKey?
     private struct SmoothKey: Equatable { var cover: Double; var crop: CGRect }
@@ -435,11 +528,15 @@ final class Project {
     }
 
     /// Call when a drag (or key) starts changing the range or the crop, and `endEdit` when it is done: one undo step.
-    func beginEdit() { if editStart == nil { editStart = edit } }
+    func beginEdit() {
+        if editStart == nil { editStart = edit }
+        updateCopyGate()
+    }
 
     func endEdit(_ name: String) {
         guard let before = editStart else { return }
         editStart = nil
+        updateCopyGate()
         if replanAfterEdit { replanAfterEdit = false; replan(immediately: true) }
         guard before != edit else { return }
         registerUndo(name) { $0.apply(before, name: name) }
@@ -480,29 +577,25 @@ final class Project {
         guard !isExporting else { return }          // dropped or opened while an export is running: ignore, never swap the source under it
         // the last video asked for wins: an earlier open still loading must not write its source, range or pictures later
         openTask?.cancel()
-        proxyGeneration += 1                // the cancelled import's progress updates no longer count
-        let generation = proxyGeneration
-        proxyProgress = nil
+        proxyTask?.cancel()
         planTask?.cancel()
+        copyGate.isHeld = false             // the old video's copy, if still being made, sees its cancellation
+        copyGate = DecodeGate()
+        copyComing = false
+        endImportActivity()
+        importActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Opening a video")
         endScrub(keepPicture: false)
         scrubSeeking = false                // a seek on the old player may never call back
         // a drag cut off without its end (gesture cancelled) must not hold back this video's plans
         editStart = nil
         replanAfterEdit = false
+        awaitingPreview = true
         phase = .loading
         lastExport = nil
         openTask = Task {
             do {
                 let src = try await FrameSource(url: url)
                 try AutoChoices.checkDuration(src)
-                do {
-                    try await attachProxy(to: src, generation: generation)
-                } catch {
-                    if Task.isCancelled { throw CancellationError() }
-                    // the copy only makes editing lighter: without it, edit the original (11-18 review)
-                    if proxyGeneration == generation { proxyProgress = nil }
-                    src.proxy = nil
-                }
                 let end = await AutoChoices.coverBeforeFadeOut(src)
                 // everything from here to `replan` happens at once, with no await in between
                 guard !Task.isCancelled else { return }
@@ -521,7 +614,7 @@ final class Project {
                 rangeStart = max(0, end - 1)
                 startIsAuto = true
                 smoothStart = nil
-                jumpyStart = nil
+                feelBands = nil
                 answeredCover = nil
                 smoothKey = nil
                 focusX = 0.5; focusY = 0.5
@@ -529,77 +622,130 @@ final class Project {
                 chooseFit()
                 suppressReplan = false
                 undoManager?.removeAllActions()
-                installPlayer(src.proxy?.url ?? url)          // scrubbing and playback on the editing copy
+                installPlayer(url)          // the original until the editing copy is ready (`makeProxy`)
                 seek(to: rangeStart)
                 viewMode = .lockScreen
                 phase = .ready
+                // the copy from the start, paused whenever the person waits for a picture or drags (`copyGate`): 11-18
+                // it waited for the analysis, which starts over with every cover moved, and never came (11-19 「特别卡」)
+                copyComing = true
+                let gate = copyGate
+                proxyTask = Task { [weak self] in
+                    await self?.makeProxy(for: src, gate: gate)
+                    if self?.source === src { self?.copyComing = false; self?.endImportActivity() }
+                }
                 replan(immediately: true)
                 filmstrip = []
+                // after the first picture: the decoder does one thing at a time at full speed
+                while source === src, awaitingPreview, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
                 let strip = await PreviewImages.filmstrip(of: src.proxy?.asset ?? src.asset, to: src.duration)
                 guard !Task.isCancelled else { return }        // a cancelled run returns [], which would blank the newer strip
                 filmstrip = strip
             } catch {
-                guard !Task.isCancelled else { return }          // a newer open owns the progress bar now
-                proxyProgress = nil
+                guard !Task.isCancelled else { return }
+                endImportActivity()
+                awaitingPreview = false
                 phase = .failed(Self.describe(error, fallback: "无法打开这个视频。文件可能已损坏，或者格式不受支持。"))
             }
         }
     }
 
     /// Large or slow-to-decode videos get a small editing copy (`ProxyMaker`), made once and kept in Caches keyed by the
-    /// file's path, size and date (11-18, 「导入可以久一些」: ~6 s for a 90 s 4K AV1 trailer, then every edit is light).
-    private func attachProxy(to src: FrameSource, generation: Int) async throws {
+    /// file's path, size and date. Made while the person already edits on the original, pausing at `gate` (#0033: the
+    /// decoder does one stream at full speed, two at once each at half); dragging and playback move to it when it is
+    /// ready, and the start search reads its farthest tier from it.
+    private func makeProxy(for src: FrameSource, gate: DecodeGate) async {
         guard await ProxyMaker.isWorthIt(src) else { return }
-        try Task.checkCancellation()
+        guard source === src else { return }
         let fm = FileManager.default
         let folder = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("LiveWall/EditingCopies")
-        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let attributes = try? fm.attributesOfItem(atPath: src.url.path)
         let key = "v\(ProxyMaker.version)|\(src.url.standardizedFileURL.path)|\(attributes?[.size] ?? 0)|\((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
-        let name = SHA256.hash(data: Data(key.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+        // the recipe's version up front: `pruneCopies` drops copies an older recipe made
+        let name = "v\(ProxyMaker.version)-" + SHA256.hash(data: Data(key.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
         let copy = folder.appendingPathComponent(name + ".mov")
-        // the progress bar belongs to the newest import only (`proxyGeneration` is bumped by `open`)
-        let current = { [weak self] in self?.proxyGeneration == generation }
-        if !fm.fileExists(atPath: copy.path) {
-            if current() { proxyProgress = 0 }
-            // its own name: the same video reopened while a copy is being made must not share (and delete) the file
-            let partial = folder.appendingPathComponent(name + "-" + UUID().uuidString + ".partial")
-            defer { try? fm.removeItem(at: partial) }
-            try await ProxyMaker.make(from: src, to: partial) { p in
-                Task { @MainActor [weak self] in
-                    if let self, self.proxyGeneration == generation, self.proxyProgress != nil { self.proxyProgress = p }
-                }
-            }
-            try Task.checkCancellation()
-            try? fm.removeItem(at: copy)
-            try fm.moveItem(at: partial, to: copy)
-            Self.pruneCopies(in: folder, keeping: copy)
-        } else {
-            try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: copy.path)   // recently used
-        }
-        if current() { proxyProgress = nil }
         do {
-            src.proxy = try await FrameSource(url: copy)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            if !fm.fileExists(atPath: copy.path) {
+                // its own name: the same video reopened while a copy is being made must not share (and delete) the file
+                let partial = folder.appendingPathComponent(name + "-" + UUID().uuidString + ".partial")
+                defer { try? fm.removeItem(at: partial) }
+                // detached, so cancel it along with this task (a new video opened)
+                let job = Task.detached(priority: .userInitiated) { try await ProxyMaker.make(from: src, to: partial, gate: gate) }
+                try await withTaskCancellationHandler { try await job.value } onCancel: { job.cancel() }
+                try Task.checkCancellation()
+                try? fm.removeItem(at: copy)
+                try fm.moveItem(at: partial, to: copy)
+                Self.pruneCopies(in: folder, keeping: copy)
+            } else {
+                try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: copy.path)   // recently used
+            }
+            let proxy = try await FrameSource(url: copy)
+            guard source === src else { return }
+            src.proxy = proxy                   // the start search can use it at once
+            copyComing = false
+            // the players swap while nothing moves: not mid-playback or mid-drag
+            while source === src, isPlaying || isScrubbing {
+                try await Task.sleep(for: .milliseconds(300))
+            }
+            guard source === src else { return }
+            switchToProxy(copy)
         } catch {
-            try? fm.removeItem(at: copy)        // a broken copy (disk full, cut short) is made again next time
-            throw error
+            // the copy only makes editing lighter: without it, edit the original (11-18 review)
+            if !(error is CancellationError) { try? fm.removeItem(at: copy) }
         }
     }
 
-    /// Keeps the 8 most recently used copies (a 90 s 4K video makes about 40 MB).
+    /// Dragging and playback move to the copy; the original's player, already on the play head, stays for exact frames.
+    private func switchToProxy(_ copy: URL) {
+        guard let original = player else { return }
+        if let observer = timeObserver { original.removeTimeObserver(observer) }
+        timeObserver = nil
+        installPlayer(copy)
+        player?.seek(to: CMTime(seconds: playhead, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        exactPlayer = original
+        exactShown = true
+    }
+
+    /// Keeps the most recently used copies: at most 8, and at most `copiesLimit` bytes together (a 90 s 4K video makes
+    /// about 40 MB; an 11-minute aerial at 30 fps about 0.6 GB). Copies of an older recipe (`ProxyMaker.version`) go too.
+    static let copiesLimit: Int64 = 3 << 30
     private static func pruneCopies(in folder: URL, keeping current: URL) {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
-        let dated = files.filter { $0.pathExtension == "mov" && $0 != current }.map {
-            ($0, (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+        guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: Array(keys)) else { return }
+        // half-made copies of an app that quit or crashed meanwhile (one being made now is minutes old at most)
+        for url in files where url.pathExtension == "partial" {
+            if let date = try? url.resourceValues(forKeys: keys).contentModificationDate, date < Date(timeIntervalSinceNow: -3600) {
+                try? fm.removeItem(at: url)
+            }
+        }
+        for url in files where url.pathExtension == "mov" && !url.lastPathComponent.hasPrefix("v\(ProxyMaker.version)-") {
+            try? fm.removeItem(at: url)
+        }
+        let dated = files.filter {
+            $0.pathExtension == "mov" && $0 != current && $0.lastPathComponent.hasPrefix("v\(ProxyMaker.version)-")
+        }.map { url in
+            let values = try? url.resourceValues(forKeys: keys)
+            return (url, values?.contentModificationDate ?? .distantPast, Int64(values?.fileSize ?? 0))
         }.sorted { $0.1 > $1.1 }
-        for (url, _) in dated.dropFirst(7) { try? fm.removeItem(at: url) }
+        var total = Int64((try? current.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        for (index, (url, _, size)) in dated.enumerated() {
+            total += size
+            if index >= 7 || total > copiesLimit { try? fm.removeItem(at: url) }
+        }
     }
 
     private func installPlayer(_ url: URL) {
         if let observer = timeObserver { player?.removeTimeObserver(observer) }
+        timeObserver = nil
         player?.pause()
         isPlaying = false
+        exactTask?.cancel()
+        exactPlayer = nil
+        exactShown = false
+        exactOutput = nil
+        exactSeeking = false
         let p = AVPlayer(url: url)
         timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600), queue: .main) { [weak self] t in
             MainActor.assumeIsolated {
@@ -613,10 +759,30 @@ final class Project {
     }
 
     /// `count` pictures spread evenly over `start ... end` (the whole video, or the trim bar's zoomed window).
-    func seek(to seconds: Double) {
+    /// `keepExact`: leave the exact picture up until the new one is there (stepping frame by frame: the copy may hold
+    /// the same frame for several steps, and flashing to it in between would flicker).
+    func seek(to seconds: Double, keepExact: Bool = false) {
         let t = min(max(0, seconds), duration)
         player?.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         playhead = t
+        if exactPlayer != nil {
+            if !keepExact { exactShown = false }
+            showExact(at: t, after: keepExact ? 0 : 150)
+        }
+    }
+
+    /// Seeks the original to `t` once the play head has stayed there `after` ms, then shows it over the copy.
+    private func showExact(at t: Double, after ms: Int) {
+        exactTask?.cancel()
+        guard let exactPlayer else { return }
+        exactTask = Task { [weak self] in
+            if ms > 0 { try? await Task.sleep(for: .milliseconds(ms)) }
+            guard !Task.isCancelled else { return }
+            let finished = await exactPlayer.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            // the play head reads back through the player's clock, in 1/600 s (review 11-20: `==` almost never held)
+            guard let self, finished, !Task.isCancelled, abs(self.playhead - t) <= 1.0 / 600, !self.isPlaying else { return }
+            self.exactShown = true
+        }
     }
 
     func togglePlay() { isPlaying ? pause() : play() }
@@ -625,20 +791,25 @@ final class Project {
         guard let player else { return }
         if playhead < rangeStart || playhead >= rangeEnd - 0.05 { seek(to: rangeStart) }
         viewMode = .source
+        exactTask?.cancel()
+        exactShown = false
         player.play()
         isPlaying = true
     }
 
     func pause() {
         player?.pause()
+        let wasPlaying = isPlaying
         isPlaying = false
+        // where playback stopped: the copy's frame until the original's arrives
+        if wasPlaying, exactPlayer != nil { showExact(at: playhead, after: 0) }
     }
 
     /// Moves the play head by whole source frames (arrow keys).
     func step(frames n: Int) {
         pause()
         let fps = source?.frameRate ?? 30
-        seek(to: playhead + Double(n) / max(1, fps))
+        seek(to: playhead + Double(n) / max(1, fps), keepExact: true)
     }
 
     /// Shortest stretch: ten source frames (one per step).
@@ -682,7 +853,12 @@ final class Project {
     func replan(immediately: Bool = false) {
         guard source != nil, !suppressReplan else { return }
         if isExporting { needsReplan = true; return }
-        if editStart != nil { replanAfterEdit = true; planTask?.cancel(); return }
+        if editStart != nil {
+            replanAfterEdit = true
+            planTask?.cancel()
+            planWhileStartRests()
+            return
+        }
         notice = nil
         planTask?.cancel()
         planTask = Task { [weak self] in
@@ -692,71 +868,196 @@ final class Project {
         }
     }
 
+    /// What the start search has measured for `smoothKey` so far, nearest the cover first.
+    private var sweep: SegmentPlanner.StartSweep?
+    /// The farthest smooth start measured when `smoothStart` was worked out: worked out again only when it moves.
+    private var smoothFrom: Double?
+    /// What a plan's pictures and checks depend on.
+    private struct PlanKey: Equatable {
+        var start, cover: Double
+        var crop, area: CGRect
+        var aspect, focusX, focusY: Double
+        var mode: ReframeMode
+    }
+    private var planKey: PlanKey {
+        PlanKey(start: rangeStart, cover: rangeEnd, crop: cropFraction, area: area, aspect: aspect, focusX: focusX, focusY: focusY,
+                mode: mode)
+    }
+    /// The choices the pictures and checks shown were planned for.
+    private var shownPlan: PlanKey?
+    /// The pictures and checks shown are for the current choices: the export waits for this, not for the start search,
+    /// which may go on further back for a while (waiting for the editing copy); the preview rests on the cover until then.
+    var planIsCurrent: Bool { shownPlan != nil && shownPlan == planKey }
+    /// The start search has measured back to 0:00 for this cover and worked the smoothest start out from all of it:
+    /// `smoothStart` and `feelBands` are final.
+    private(set) var searchIsComplete = false
+    /// The picture is up with an automatic start found from the nearest 2 s; the search is still measuring the start
+    /// row's 20 s, after which the start may move once, together with the colour bar appearing. The trim bar says so.
+    private(set) var startIsSettling = false {
+        didSet { if startIsSettling, !startIsAuto { startIsSettling = false } }
+    }
+
+    /// While the start handle is dragged on the editing copy, the plan for where it rests (200 ms still), so the frame
+    /// marks and the preview are right on release, or right after (11-20, the user: 「拖动选起点之后，10帧在时间轴上的标记
+    /// 没有实时跟随时间轴，过了一会锁屏又播放了一遍才好」; a new start took 2.5–4 s to plan on 香港天际线). Not on the 4K
+    /// original: the drag's own seeks need the decoder there (11-18 「很卡」).
+    private func planWhileStartRests() {
+        guard let source, exactPlayer != nil, let sweep, !answersAreStale,
+              smoothKey == SmoothKey(cover: min(rangeEnd, source.duration), crop: cropFraction) else { return }
+        let cover = sweep.cover, crop = sweep.crop
+        planTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard let self, !Task.isCancelled else { return }
+            try? await self.showPlan(source: source, cover: cover, crop: crop)
+        }
+    }
+
+    /// A new cover (or crop) is measured from the cover back, one tier at a time. The picture comes after the nearest 2 s;
+    /// the start row's 20 s next, then the colour bar appears whole and the automatic start moves there if it has to, once,
+    /// with 「正在找最顺的起点…」 shown until then (`startIsSettling`). 11-19 the start and the bar followed tier by tier,
+    /// which read as the range and the bar changing by themselves (11-20); all at once after the 20 s took 14 s a cover on
+    /// 香港天际线, and the user chose this. Beyond the row, from the editing copy, for when the person widens it.
     private func runPlan() async {
         guard let source else { return }
         if isExporting { needsReplan = true; return }
-        if case .failed = phase {} else { phase = .planning }     // never clear an error that has not been seen
+        // never clear an error that has not been seen; and only while a new picture is coming (one planned while the
+        // start rested, or the same choices again, needs none, and nothing would set it back, review 11-20)
+        if case .failed = phase {} else if !planIsCurrent { phase = .planning } else if phase == .planning { phase = .ready }
         notice = nil
         planFailed = nil
+        planGeneration += 1
+        let generation = planGeneration
+        searchingNear = true
+        defer { if planGeneration == generation { searchingNear = false } }        // not a newer run's
         do {
             let cover = min(rangeEnd, source.duration), crop = cropFraction
             let chosenCover = rangeEnd
             let key = SmoothKey(cover: cover, crop: crop)
-            let newCover = smoothKey != key
-            if newCover {
-                // the old cover's answers would sit in the wrong place on the colour bar meanwhile; and forget whose
-                // they were, or a cancelled run here would leave them nil for good when that cover comes back (undo)
+            if smoothKey != key || sweep == nil {
+                // the old cover's answers would sit in the wrong place on the colour bar meanwhile
                 smoothStart = nil
-                jumpyStart = nil
-                smoothKey = nil
+                smoothFrom = nil
+                feelBands = nil
                 answeredCover = nil
-                let found = try await SegmentPlanner.smoothestStart(source: source, cover: cover, crop: crop)
-                try Task.checkCancellation()
-                smoothStart = found
-                jumpyStart = nil
+                sweep = SegmentPlanner.StartSweep(source: source, cover: cover, crop: crop)
                 smoothKey = key
+                searchIsComplete = false
+                startIsSettling = startIsAuto           // the hint from the moment the cover is let go
+                awaitingPreview = true
             }
-            if startIsAuto, let smoothStart, rangeStart != smoothStart {
-                suppressReplan = true           // this is the plan for it
-                rangeStart = smoothStart
-                suppressReplan = false
-            }
-            let planned = try await SegmentPlanner.plan(source: source, start: rangeStart, cover: cover, crop: crop)
-            try Task.checkCancellation()
-
-            let width = 480
-            let decoded = try await source.frames(at: planned.times, width: width)
-            try Task.checkCancellation()
-            let plan = Reframe.plan(sourceSize: CGSize(width: decoded[0].width, height: decoded[0].height), aspect: aspect, mode: mode,
-                                    focus: CGPoint(x: focusX, y: focusY), area: area)
-            // resizing and the checks are pixel loops: off the main thread, so dragging stays smooth
-            let images = try await Task.detached(priority: .userInitiated) {
-                try PreviewImages.wallpaper(decoded, plan: plan, blend: planned.blend)
-            }.value
-            try Task.checkCancellation()
-            times = planned.times
-            blend = planned.blend
-            feel = planned.feel
-            frames = images
-            scrubFrame = nil                    // the plan's own cover from now on (a drag still going puts its picture back)
-            report = planned.report
-            if phase == .planning { phase = .ready }
-            if newCover || jumpyStart == nil {
-                let jumpy = try await SegmentPlanner.smoothestStart(source: source, cover: cover, crop: crop,
-                                                                    ceiling: SegmentPlanner.jumpyStep)
+            guard var sweep else { return }
+            var needsPlan = !planIsCurrent      // planned while the start rested (`planWhileStartRests`)
+            // the start row's whole window (`SegmentPlanner.startReach` back): the automatic start, the picture and the
+            // colour bar come together and stay put (11-20, the user: 「范围在很多情况下会自己变」「颜色条的出现时机也让
+            // 人很奇怪，不知道什么时候会出来，出来的还是部分的」)
+            let window = min(cover, SegmentPlanner.startReach)
+            while true {
+                // an automatic start goes to the smoothest one; a start set by hand gets its picture first, this after.
+                // The first picture of a cover comes from the nearest tier (11-20, the user chose 「先出画面」: 4–6 s on
+                // 香港天际线 instead of 14); the rest of the window may then move the start once, announced meanwhile
+                if startIsAuto || !needsPlan {
+                    let firstLook = awaitingPreview && startIsAuto
+                    while firstLook ? (sweep.points.isEmpty && !sweep.isComplete) : !sweep.reached(window) {
+                        while isExporting { try await Task.sleep(for: .milliseconds(250)) }    // the export decodes first
+                        try await sweep.measureNextTier(source: source, copy: source.proxy)
+                        try Task.checkCancellation()
+                        self.sweep = sweep
+                    }
+                    let reach = sweep.points.prefix {
+                        $0.maxStep <= SegmentPlanner.smoothStep && cover - $0.start <= SegmentPlanner.startReach + 1e-6
+                    }.last?.start
+                    if firstLook, !sweep.reached(window) {
+                        // the first picture: the farthest smooth start of the nearest tier as it is, without the checks
+                        // on the real frames (2.5–4 s more on 香港天际线); those come with the rest of the window
+                        startIsSettling = true
+                        smoothStart = cover > minSpan ? max(0, reach ?? cover - minSpan) : 0
+                        smoothFrom = nil
+                    } else if smoothStart == nil || reach != smoothFrom {
+                        let found = try await SegmentPlanner.smoothestStart(source: source, sweep: sweep)
+                        try Task.checkCancellation()
+                        smoothStart = found
+                        smoothFrom = reach
+                    }
+                    if startIsAuto, let smoothStart, rangeStart != smoothStart {
+                        suppressReplan = true           // this is the plan for it
+                        rangeStart = smoothStart
+                        suppressReplan = false
+                        needsPlan = true
+                    }
+                }
+                if needsPlan {
+                    try await showPlan(source: source, cover: cover, crop: crop,
+                                       bands: sweep.reached(window) ? SegmentPlanner.feelBands(sweep) : nil)
+                    needsPlan = false
+                    answeredCover = chosenCover
+                    awaitingPreview = false
+                    if phase == .planning { phase = .ready }
+                    // a start set by hand: the window and the smoothest start next, also when a run cut short (a drag)
+                    // left the search measured but that answer not worked out (11-20: 1.97 s where it was 6.45 s)
+                    continue
+                }
+                // the bar only whole: once the window is measured
+                feelBands = sweep.reached(window) ? SegmentPlanner.feelBands(sweep) : nil
+                if !sweep.reached(window) { continue }
+                startIsSettling = false
+                if sweep.isComplete { searchIsComplete = true; break }
+                // past the window: shown only when the person widens the start row, so from the editing copy (seconds
+                // instead of a minute on a long 4K video), once it is there
+                searchingNear = false
+                while copyComing, source.proxy == nil { try await Task.sleep(for: .milliseconds(250)) }
+                while isExporting { try await Task.sleep(for: .milliseconds(250)) }
+                do {
+                    try await sweep.measureNextTier(source: source, copy: source.proxy)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    break       // only the bar past the start row is missing: nothing to report (review 11-20)
+                }
                 try Task.checkCancellation()
-                jumpyStart = min(jumpy, smoothStart ?? jumpy)
+                self.sweep = sweep
             }
-            answeredCover = chosenCover
         } catch is CancellationError {
             return
         } catch {
             // keep whatever was shown before; the sidebar offers to try again
             scrubFrame = nil
             answeredCover = rangeEnd            // nothing more is coming for this cover: stop waiting for it
+            awaitingPreview = false
+            startIsSettling = false
             planFailed = Self.describe(error, fallback: "无法分析这一段视频。")
             phase = .ready
         }
+    }
+
+    /// Plans `rangeStart ... cover` and puts its pictures and checks up, with `bands` for the colour bar at the same
+    /// moment when given.
+    private func showPlan(source: FrameSource, cover: Double, crop: CGRect, bands: [SegmentPlanner.FeelBand]? = nil) async throws {
+        let key = planKey
+        let planned = try await SegmentPlanner.plan(source: source, start: rangeStart, cover: cover, crop: crop)
+        try Task.checkCancellation()
+        // at the width the plan measured them: already decoded (11-19: decoding them again at 480 took a second or two
+        // of a 4K 240 fps aerial's first picture)
+        let decoded = try await source.frames(at: planned.times, width: WindowPlanner.measuredWidth(crop: crop))
+        try Task.checkCancellation()
+        let plan = Reframe.plan(sourceSize: CGSize(width: decoded[0].width, height: decoded[0].height), aspect: aspect, mode: mode,
+                                focus: CGPoint(x: focusX, y: focusY), area: area)
+        // resizing and the checks are pixel loops: off the main thread, so dragging stays smooth
+        let images = try await Task.detached(priority: .userInitiated) {
+            try PreviewImages.wallpaper(decoded, plan: plan, blend: planned.blend)
+        }.value
+        try Task.checkCancellation()
+        times = planned.times
+        blend = planned.blend
+        feel = planned.feel
+        frames = images
+        // the plan's own cover from now on; not under a start drag held still (`planWhileStartRests`), whose picture is
+        // what the person is looking at (review 11-20)
+        if !isScrubbing { scrubFrame = nil }
+        report = planned.report
+        if let bands { feelBands = bands }
+        shownPlan = key
+        // also when this run is a plan made while the start rested: a run cut short may have left 分析中 up (review)
+        if phase == .planning, planIsCurrent { phase = .ready }
     }
 
     // MARK: export
@@ -768,10 +1069,12 @@ final class Project {
         let directory = packageURL.deletingLastPathComponent()
         let requested = sourceURL
         Task { [weak self] in
-            // a newer plan may start while waiting: wait for whichever is current
-            while let task = self?.planTask {
-                await task.value
-                if self?.planTask == task { break }
+            // the pictures for the current choices (a newer plan may start while waiting), with the automatic start
+            // settled (review 11-20: an export during 「正在找最顺的起点…」 saved the provisional one); not the search
+            // past the start row
+            while let self, !self.planIsCurrent || self.startIsSettling, self.planFailed == nil, self.planTask != nil,
+                  self.sourceURL == requested {
+                try? await Task.sleep(for: .milliseconds(100))
             }
             guard let self else { return }
             // another video was opened meanwhile: that is what the person is doing now, drop this export quietly

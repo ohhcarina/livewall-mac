@@ -222,13 +222,7 @@ private struct EmptyState: View {
                 .glassButtonStyle(prominent: true)
                 .controlSize(.extraLarge)
                 Text("或者直接把视频拖进来").font(.callout).foregroundStyle(.tertiary)
-                if let p = project.proxyProgress {
-                    // the editing copy: a few seconds for 4K, once per video
-                    VStack(spacing: 6) {
-                        ProgressView(value: p).frame(width: 220)
-                        Text("正在准备编辑用的副本…").font(.callout).foregroundStyle(.secondary)
-                    }
-                } else if project.phase == .loading {
+                if project.phase == .loading {
                     ProgressView().controlSize(.small)
                 }
             }
@@ -265,18 +259,6 @@ private struct Editor: View {
             // stacked, not overlaid: the bar's height changes with its rows (two since 11-12)
             VStack(spacing: 16) {
                 stage
-                    .overlay {
-                        // another video's editing copy is being made while this one is still shown (11-18 review)
-                        if let p = project.proxyProgress {
-                            VStack(spacing: 8) {
-                                ProgressView(value: p).frame(width: 220)
-                                Text("正在准备编辑用的副本…").font(.callout).foregroundStyle(.secondary)
-                            }
-                            .padding(16)
-                            .glassPanel(cornerRadius: 16)
-                            .transition(.opacity)
-                        }
-                    }
                     .padding(.horizontal, 40)
                     .padding(.top, 60)
                 TrimBar(project: project)
@@ -342,7 +324,10 @@ private struct Editor: View {
                 // while a new plan is computed the old one stays, slightly dimmed: no flashing spinner
                 // while the cover or the start is dragged, the frame under the pointer stands in for the cover (the preview rests on its last frame)
                 LockSimView(frames: project.scrubFrame.map { Array(project.frames.dropLast()) + [$0] } ?? project.frames,
-                            aspect: project.aspect, replayToken: project.wakeCount, holdOnCover: project.isScrubbing,
+                            aspect: project.aspect, replayToken: project.wakeCount,
+                            // and until the new choices' plan is in: no replay of the old one meanwhile (11-20 「锁屏又播放
+                            // 了一遍」); the new one then plays once
+                            holdOnCover: project.isScrubbing || !project.planIsCurrent,
                             showsHoverHint: !SnapshotHook.scripted)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .opacity(project.phase == .planning && project.scrubFrame == nil ? 0.55 : 1)
@@ -372,6 +357,12 @@ private struct SourceStage: View {
             ZStack(alignment: .topLeading) {
                 if let player = project.player {
                     PlayerView(player: player)
+                        .overlay {
+                            // the original's exact frame while the picture rests (the copy keeps 30 frames a second)
+                            if let exact = project.exactPlayer {
+                                PlayerView(player: exact).opacity(project.exactShown ? 1 : 0)
+                            }
+                        }
                         .frame(width: fit.width, height: fit.height)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
@@ -759,14 +750,17 @@ private struct Sidebar: View {
 
             Section {
                 if let verdict = project.verdict, let report = project.report {
+                    // dimmed while it may still change: a new plan, or the automatic start still settling
+                    let pending = project.phase == .planning || project.startIsSettling
                     VerdictHeader(verdict: verdict)
                         .padding(.vertical, 4)
-                        .opacity(project.phase == .planning ? 0.45 : 1)
+                        .opacity(pending ? 0.45 : 1)
                         .overlay(alignment: .topTrailing) {
-                            if project.phase == .planning { ProgressView().controlSize(.small).padding(.top, 4) }
+                            if pending { ProgressView().controlSize(.small).padding(.top, 4) }
                         }
-                        .animation(.easeOut(duration: 0.15), value: project.phase == .planning)
-                    Text(String(format: "封面前 %.1f 秒 · %.1f× 快放", project.span, project.speedUp))
+                        .animation(.easeOut(duration: 0.15), value: pending)
+                    Text(project.startIsSettling ? "正在找最顺的起点…"
+                                                 : String(format: "封面前 %.1f 秒 · %.1f× 快放", project.span, project.speedUp))
                         .font(.callout).monospacedDigit().foregroundStyle(.secondary)
                     if !project.startIsAuto, project.smoothStart != nil { smoothestRow }
                     if let notice = project.notice {

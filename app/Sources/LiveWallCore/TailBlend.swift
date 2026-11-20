@@ -50,6 +50,31 @@ public enum TailBlend {
         return alphas
     }
 
+    /// How far the frames before the cover may stay from it in the region that changed most (`localMaxDiff`, second-to-
+    /// last first). 11-18 GTA logo: words popping in over the last 3 frames on a still background kept that region
+    /// 55, 135, 136, 132 away while the mean read 3.4, 8, 13, 16, and motion never turned on (rounds 46-47). The same
+    /// frames mixed to 20, 44, 71, 99, 129 (R48-2) and to 10, 21, 35, 50 (R48-1) both did. The first is looser than
+    /// R48-2: Mac aerials that turned on stay 22-27 there (Scotland coast, Carrizo plain, Hong Kong), R47-3 55, and
+    /// mixing moving footage doubles it (R6-1). Where between these and the failing ones the real limit is was not measured.
+    public static let localTailCap: [Double] = [30, 44, 71, 99, 129]
+
+    /// Like `alphas(window:allowed:)`, measured on the region that changed most: mixing scales every pixel's difference
+    /// to the cover by (1 - a), so each cell's too, and `a` follows exactly from the limit. Closer to the cover never
+    /// mixes less than the frame before (11-18 R51: 0.68 then 0.32 showed the words sharp, soft again, then sharp,
+    /// 「末尾auto底部发虚又恢复了」; an App export of the same frames did not turn motion on).
+    public static func alphas(window: [RGB16Image], localAllowed: [Double]) -> [Double] {
+        var alphas = [Double](repeating: 0, count: window.count)
+        guard window.count >= 3, let cover = window.last else { return alphas }
+        for (k, limit) in localAllowed.enumerated() {
+            let i = window.count - 2 - k
+            guard i >= 1 else { break }
+            let distance = window[i].localMaxDiff(cover)
+            if distance > limit { alphas[i] = 1 - limit / distance }
+        }
+        for i in 2..<(window.count - 1) { alphas[i] = max(alphas[i], alphas[i - 1]) }
+        return alphas
+    }
+
     /// frames[i] = (1 - alphas[i]) * frames[i] + alphas[i] * frames.last, in place. All frames must have the same size.
     public static func apply(_ frames: inout [RGB16Image], alphas: [Double]) throws {
         guard alphas.count == frames.count else {

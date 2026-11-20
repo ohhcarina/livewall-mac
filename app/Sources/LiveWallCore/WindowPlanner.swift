@@ -84,11 +84,15 @@ public enum WindowPlanner {
 
     /// The frames at `times` as the checks see them: cropped like the wallpaper, `WindowAnalysis.reversalWidth` across.
     public static func windowFrames(source: FrameSource, times: [Double], crop: CGRect = fullFrame) async throws -> [RGB16Image] {
-        let frames = try await source.frames(at: times, width: decodeWidth(WindowAnalysis.reversalWidth, crop: crop), fromProxy: false)
+        let frames = try await source.frames(at: times, width: decodeWidth(WindowAnalysis.reversalWidth, crop: crop))
         return try frames.map { try cropped($0, to: crop, width: WindowAnalysis.reversalWidth) }
     }
 
     /// Decode wide enough that the crop alone is `width` across (capped, for thin crops of large sources).
+    /// The width `windowFrames` decodes at for this crop: pictures of the planned frames decoded at it come from what
+    /// the plan has just decoded (`FrameSource`'s cache) instead of being decoded again (#0033).
+    public static func measuredWidth(crop: CGRect) -> Int { decodeWidth(WindowAnalysis.reversalWidth, crop: crop) }
+
     static func decodeWidth(_ width: Int, crop: CGRect) -> Int {
         min(width * 4, Int((Double(width) / max(0.05, Double(crop.width))).rounded(.up)))
     }
